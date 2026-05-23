@@ -1,0 +1,69 @@
+DATOS_REPORTE = {
+    "patient_profile": {
+        "age": 34,
+        "height_cm": 172,
+        "weight_kg": 78,
+        "occupation_or_daily_role": "trabajo de pie en comercio",
+        "dominant_side": "derecho",
+    },
+    "amputation_profile": {
+        "limb": "inferior",
+        "side": "izquierdo",
+        "level_reported": "debajo de la rodilla",
+        "level_interpreted": "transtibial probable",
+        "cause_category": "traumatica",
+        "cause_detail": "accidente de moto",
+        "time_since_amputation": "2 años",
+        "previous_prosthesis_use": True,
+    },
+    "residual_limb_status": {
+        "pain_present": True,
+        "pain_score_0_10": 4,
+        "phantom_pain": False,
+        "skin_issues": ["irritación ocasional", "sudoración"],
+        "open_wound_reported": False,
+        "sensitivity_areas": "zona distal",
+        "volume_changes_reported": True,
+    },
+    "functional_goals": {
+        "main_goal": "caminar y trabajar con mayor estabilidad",
+        "daily_use_expected_hours": 8,
+        "activity_level": "moderado",
+        "priority_activities": [
+            "caminar en calle",
+            "subir escaleras",
+            "usar transporte público",
+        ],
+        "environment": [
+            "clima caluroso",
+            "terreno urbano",
+            "transporte público",
+        ],
+    },
+    "design_preferences": {
+        "top_priorities": [
+            "comodidad",
+            "resistencia",
+            "facilidad para poner y quitar",
+        ],
+        "appearance_preference": "discreta/natural",
+        "color_or_style": "sin preferencia específica",
+        "customization_interest": False,
+    },
+    "patient_concerns": {
+        "main_concern": "que le genere dolor después de varias horas",
+        "expectations": "poder trabajar sin depender tanto de otras personas",
+    },
+    "professional_flags": {
+        "requires_skin_review": True,
+        "requires_pain_review": True,
+        "information_confidence": "media",
+        "missing_data": [
+            "medidas clínicas exactas",
+            "escaneo del muñón",
+            "evaluación presencial",
+        ],
+    },
+    "modelo miembro": "https://storage.signa.app/models/miembro-izquierdo-transtibial.stl",
+    "modelo protesis": "https://storage.signa.app/models/protesis-izquierda-transtibial.stl",
+}
