@@ -36,9 +36,36 @@ except ImportError as exc:
 DEFAULT_RADIAL_CLEARANCE_MM = 1.5
 MIN_RADIAL_CLEARANCE_MM = 1.0
 MAX_RADIAL_CLEARANCE_MM = 3.0
-DEFAULT_WALL_THICKNESS_MM = 4.0
-DEFAULT_SOCKET_LENGTH_FRACTION = 0.85
-DEFAULT_PROXIMAL_FILLET_MM = 2.0
+DEFAULT_WALL_THICKNESS_MM = 3.5
+DEFAULT_WALL_THICKNESS_DISTAL_MM = 4.0
+MIN_SHELL_WALL_MM = 3.0
+DEFAULT_SOCKET_LENGTH_FRACTION = 0.80
+DEFAULT_PROXIMAL_FILLET_MM = 1.5
+DEFAULT_PROXIMAL_FLARE_MM = 3.0
+DEFAULT_PROXIMAL_FLARE_HEIGHT_FRACTION = 0.12
+DEFAULT_ADAPTER_COLLAR_HEIGHT_MM = 18.0
+DEFAULT_ADAPTER_COLLAR_EXTRA_WALL_MM = 1.5
+DEFAULT_DISTAL_CAP_MM = 3.0
+DEFAULT_PROSTHESIS_ADAPTER_HEIGHT_MM = 28.0
+DEFAULT_DISTAL_CORE_FILL_FRACTION = 0.14
+DEFAULT_DISTAL_CORE_MAX_Z_FRACTION = 0.22
+DEFAULT_PROXIMAL_ENTRY_SECTIONS = 4
+DEFAULT_PLUG_TAPER_TIERS = 4
+DEFAULT_PROSTHESIS_NECK_FRACTION = 0.10
+DEFAULT_PROSTHESIS_NECK_WALL_MM = 3.5
+DEFAULT_PROSTHESIS_ADAPTER_DIAMETER_MM = 38.0
+DEFAULT_PROSTHESIS_ADAPTER_PLATE_MM = 10.0
+PROXIMAL_SIMPLE_FIT = True
+# Boca proximal: solo contorno del escaneo + holgura (mm desde z_max), sin PTB ni sólidos
+DEFAULT_PROXIMAL_ENTRY_DEPTH_MM = 12.0
+MAX_PROXIMAL_ENTRY_DEPTH_MM = 18.0
+DISTAL_ANCHOR_MAX_SECTIONS = 3
+DEFAULT_PATELLAR_BAR_DEPTH_MM = 2.0
+DEFAULT_POSTERIOR_RELIEF_MM = 0.8
+MAX_LOFT_SECTIONS = 20
+LOFT_CONTOUR_POINTS = 48
+# Muñón transtibial plausible; por encima → error de unidades en entrada o export
+_MAX_STL_EXTENT_MM = 900.0
 
 
 @dataclass
@@ -64,6 +91,99 @@ def _report_get(report: dict[str, Any], *keys: str, default: Any = None) -> Any:
             return default
         node = node.get(key, default)
     return node
+
+
+def subsample_sections_for_loft(
+    sections: list[dict[str, Any]], max_sections: int = MAX_LOFT_SECTIONS
+) -> list[dict[str, Any]]:
+    """Reduce secciones para loft OCCT estable (demasiadas secciones → Null TopoDS_Shape)."""
+    if len(sections) <= max_sections:
+        return sections
+    indices = [
+        int(round(i * (len(sections) - 1) / (max_sections - 1)))
+        for i in range(max_sections)
+    ]
+    indices = sorted(set(indices) | {0, len(sections) - 1})
+    return [sections[i] for i in indices]
+
+
+def _shape_is_valid(model: cq.Workplane) -> bool:
+    try:
+        solid = model.val()
+        if solid is None:
+            return False
+        volume = float(solid.Volume())
+        return volume > 0 and math.isfinite(volume)
+    except Exception:
+        return False
+
+
+def _build_socket_shell(
+    sections: list[dict[str, Any]],
+    inner_offsets: list[float],
+    *,
+    wall_proximal_mm: float,
+    wall_distal_mm: float,
+    transtibial_profile: dict[str, Any],
+    outer_flares: list[float],
+    extra_walls: list[float],
+    neck_transition_fraction: float = DEFAULT_PROSTHESIS_NECK_FRACTION,
+    neck_wall_mm: float = DEFAULT_PROSTHESIS_NECK_WALL_MM,
+    proximal_entry_depth_mm: float = DEFAULT_PROXIMAL_ENTRY_DEPTH_MM,
+) -> tuple[cq.Workplane, tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]], list[str]]:
+    """
+    Construye cáscara socket con fallback progresivo si OCCT devuelve sólido nulo.
+    """
+    notes: list[str] = []
+
+    def _try_transtibial(profile: dict[str, Any]) -> tuple[cq.Workplane | None, tuple | None]:
+        inner_profiles, outer_profiles = build_transtibial_socket_profiles(
+            sections,
+            inner_offsets,
+            wall_proximal_mm=wall_proximal_mm,
+            wall_distal_mm=wall_distal_mm,
+            outer_flare_per_section=outer_flares,
+            extra_wall_per_section=extra_walls,
+            transtibial_profile=profile,
+            neck_transition_fraction=neck_transition_fraction,
+            neck_wall_mm=neck_wall_mm,
+            proximal_entry_depth_mm=proximal_entry_depth_mm,
+        )
+        try:
+            outer_body = _loft_from_section_profiles(sections, outer_profiles)
+            inner_body = _loft_from_section_profiles(sections, inner_profiles)
+            if not _shape_is_valid(outer_body) or not _shape_is_valid(inner_body):
+                return None, None
+            shell = outer_body.cut(inner_body)
+            if not _shape_is_valid(shell):
+                return None, None
+            return shell, (inner_profiles, outer_profiles)
+        except Exception:
+            return None, None
+
+    model, profiles = _try_transtibial(transtibial_profile)
+    if model is not None and profiles is not None:
+        return model, profiles, notes
+
+    if transtibial_profile.get("enabled", True):
+        notes.append("Fallback CAD: perfil PTB desactivado por geometría inestable")
+        disabled_profile = {**transtibial_profile, "enabled": False}
+        model, profiles = _try_transtibial(disabled_profile)
+        if model is not None and profiles is not None:
+            return model, profiles, notes
+
+    notes.append("Fallback CAD: cáscara uniforme sin flare proximal")
+    uniform_wall = max(wall_proximal_mm, wall_distal_mm)
+    try:
+        model = loft_shell_from_agent(sections, inner_offsets, uniform_wall)
+        if not _shape_is_valid(model):
+            raise ValueError("Null TopoDS_Shape object")
+        empty_profiles: tuple[list, list] = ([], [])
+        return model, empty_profiles, notes
+    except Exception as exc:
+        raise ValueError(
+            f"CadQuery no pudo generar el sólido del socket: {exc}"
+        ) from exc
 
 
 def filter_valid_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -143,6 +263,156 @@ def offset_contour_2d(
         return [(float(x), float(y)) for x, y in coords[:-1]]
 
     raise ValueError(f"Offset 2D fallido ({distance_mm:.2f} mm): {last_error}")
+
+
+def offset_points_2d(
+    points: list[tuple[float, float]], distance_mm: float, max_retries: int = 4
+) -> list[tuple[float, float]]:
+    """Offset radial 2D desde una polilínea ya cerrada o abierta."""
+    contour = [[float(x), float(y)] for x, y in points]
+    return offset_contour_2d(contour, distance_mm, max_retries=max_retries)
+
+
+def _contour_centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
+    arr = np.array(points, dtype=np.float64)
+    if arr.shape[0] < 3:
+        return float(arr[:, 0].mean()), float(arr[:, 1].mean())
+    return float(arr[:, 0].mean()), float(arr[:, 1].mean())
+
+
+def _smoothstep(t: float) -> float:
+    t = float(np.clip(t, 0.0, 1.0))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def interpolate_scalar_at_z(
+    z_mm: float,
+    z_min: float,
+    z_max: float,
+    value_at_distal: float,
+    value_at_proximal: float,
+) -> float:
+    """Interpola linealmente entre distal (z_min) y proximal (z_max)."""
+    span = float(z_max) - float(z_min)
+    if span <= 1e-9:
+        return float(value_at_proximal)
+    t = (float(z_mm) - float(z_min)) / span
+    t = float(np.clip(t, 0.0, 1.0))
+    return float(value_at_distal) + t * (float(value_at_proximal) - float(value_at_distal))
+
+
+def _angular_profile_delta_mm(
+    angle_deg: float,
+    z_frac: float,
+    *,
+    patellar_bar_depth_mm: float,
+    posterior_relief_mm: float,
+    lateral_flare_mm: float,
+) -> float:
+    """
+    Deformación angular del contorno interior (mm, positivo = más holgura hacia afuera).
+    Perfil PTB simplificado: barra rotuliana anterior, alivio posterior, flare lateral proximal.
+    """
+    angle = float(angle_deg) % 360.0
+    delta = 0.0
+
+    if 0.30 <= z_frac <= 0.82:
+        anterior_span = min(abs(angle - 0.0), abs(angle - 360.0))
+        anterior_weight = max(0.0, math.cos(math.radians(anterior_span))) ** 2
+        if anterior_weight > 0.35:
+            delta -= patellar_bar_depth_mm * anterior_weight
+
+        post_span = min(abs(angle - 180.0), 360.0 - abs(angle - 180.0))
+        if post_span <= 45.0:
+            post_weight = math.cos(math.radians(post_span)) ** 2
+            delta += posterior_relief_mm * post_weight
+
+        medial_span = min(abs(angle - 90.0), 360.0 - abs(angle - 90.0))
+        medial_weight = max(0.0, math.cos(math.radians(medial_span))) ** 2
+        if medial_weight > 0.45 and z_frac < 0.65:
+            delta += 0.35 * posterior_relief_mm * medial_weight
+
+    if z_frac >= 0.68:
+        lateral_targets = (250.0, 290.0)
+        for target in lateral_targets:
+            span = abs(((angle - target + 180.0) % 360.0) - 180.0)
+            if span <= 35.0:
+                lat_weight = _smoothstep((z_frac - 0.68) / 0.32) * math.cos(math.radians(span)) ** 2
+                delta += lateral_flare_mm * lat_weight
+
+    return delta
+
+
+def apply_transtibial_angular_deform(
+    points: list[tuple[float, float]],
+    z_frac: float,
+    profile: dict[str, Any],
+) -> list[tuple[float, float]]:
+    """Aplica perfil transtibial PTB al contorno interior por sector angular."""
+    if not profile.get("enabled", True):
+        return points
+
+    cx, cy = _contour_centroid(points)
+    patellar = float(profile.get("patellar_bar_depth_mm", DEFAULT_PATELLAR_BAR_DEPTH_MM))
+    posterior = float(profile.get("posterior_relief_mm", DEFAULT_POSTERIOR_RELIEF_MM))
+    lateral_flare = float(profile.get("lateral_flare_mm", profile.get("proximal_lateral_flare_mm", 2.5)))
+
+    deformed: list[tuple[float, float]] = []
+    for x, y in points:
+        dx, dy = float(x) - cx, float(y) - cy
+        radius = math.hypot(dx, dy)
+        if radius < 1e-9:
+            deformed.append((float(x), float(y)))
+            continue
+        angle_deg = math.degrees(math.atan2(dy, dx)) % 360.0
+        delta = _angular_profile_delta_mm(
+            angle_deg,
+            z_frac,
+            patellar_bar_depth_mm=patellar,
+            posterior_relief_mm=posterior,
+            lateral_flare_mm=lateral_flare,
+        )
+        scale = max(radius + delta, radius * 0.85) / radius
+        deformed.append((cx + dx * scale, cy + dy * scale))
+    return deformed
+
+
+def compute_proximal_envelope_per_section(
+    sections: list[dict[str, Any]],
+    *,
+    flare_mm: float,
+    flare_height_fraction: float,
+    collar_height_mm: float,
+    collar_extra_wall_mm: float,
+) -> tuple[list[float], list[float]]:
+    """
+    Calcula ensanchamiento exterior y refuerzo de pared en zona proximal (adaptador/prótesis).
+    Devuelve (outer_flare_mm, extra_wall_mm) por sección.
+    """
+    z_min = float(sections[0]["z_mm"])
+    z_max = float(sections[-1]["z_mm"])
+    span = max(z_max - z_min, 1e-6)
+    flare_z_start = z_max - span * float(np.clip(flare_height_fraction, 0.05, 0.45))
+    collar_z_start = z_max - float(max(collar_height_mm, 0.0))
+
+    outer_flares: list[float] = []
+    extra_walls: list[float] = []
+    for sec in sections:
+        z = float(sec["z_mm"])
+        if z < flare_z_start - 1e-6:
+            outer_flares.append(0.0)
+            extra_walls.append(0.0)
+            continue
+
+        flare_t = _smoothstep((z - flare_z_start) / max(z_max - flare_z_start, 1e-6))
+        collar_t = 0.0
+        if z >= collar_z_start - 1e-6:
+            collar_t = _smoothstep((z - collar_z_start) / max(z_max - collar_z_start, 1e-6))
+
+        outer_flares.append(round(flare_mm * flare_t, 4))
+        extra_walls.append(round(collar_extra_wall_mm * max(flare_t, collar_t), 4))
+
+    return outer_flares, extra_walls
 
 
 def resample_contour(points: list[tuple[float, float]], n: int = 128) -> list[tuple[float, float]]:
@@ -296,25 +566,35 @@ def apply_local_modifications_to_offsets(
     return final, applied_log, notes
 
 
-def _loft_from_sections_per_offset(
+def _build_section_profile_points(
+    sec: dict[str, Any],
+    offset_mm: float,
+    *,
+    z_frac: float,
+    transtibial_profile: dict[str, Any] | None,
+    apply_profile: bool,
+) -> list[tuple[float, float]]:
+    pts = offset_contour_2d(sec["contour"], float(offset_mm))
+    if apply_profile and transtibial_profile:
+        pts = apply_transtibial_angular_deform(pts, z_frac, transtibial_profile)
+    return resample_contour(pts, LOFT_CONTOUR_POINTS)
+
+
+def _loft_from_section_profiles(
     sections: list[dict[str, Any]],
-    offsets_per_section: list[float],
+    profile_points_per_section: list[list[tuple[float, float]]],
 ) -> cq.Workplane:
-    """Loft con offset radial distinto por sección (agent-driven)."""
-    if len(sections) != len(offsets_per_section):
-        raise ValueError("offsets_per_section debe alinearse con sections")
+    if len(sections) != len(profile_points_per_section):
+        raise ValueError("profile_points_per_section debe alinearse con sections")
 
     z_base = float(sections[0]["z_mm"])
     loft_wp: cq.Workplane | None = None
     prev_z = 0.0
 
-    for sec, offset_mm in zip(sections, offsets_per_section):
+    for sec, pts in zip(sections, profile_points_per_section):
         z = float(sec["z_mm"]) - z_base
         delta = z - prev_z
         prev_z = z
-
-        pts = offset_contour_2d(sec["contour"], float(offset_mm))
-        pts = resample_contour(pts, 64)
 
         if loft_wp is None:
             loft_wp = cq.Workplane("XY").polyline(pts).close()
@@ -326,15 +606,489 @@ def _loft_from_sections_per_offset(
     return loft_wp.loft(combine=True)
 
 
+def _loft_from_sections_per_offset(
+    sections: list[dict[str, Any]],
+    offsets_per_section: list[float],
+) -> cq.Workplane:
+    """Loft con offset radial distinto por sección (legacy / compat)."""
+    if len(sections) != len(offsets_per_section):
+        raise ValueError("offsets_per_section debe alinearse con sections")
+
+    z_min = float(sections[0]["z_mm"])
+    z_max = float(sections[-1]["z_mm"])
+    span = max(z_max - z_min, 1e-6)
+    profiles = [
+        _build_section_profile_points(
+            sec,
+            offset_mm,
+            z_frac=(float(sec["z_mm"]) - z_min) / span,
+            transtibial_profile=None,
+            apply_profile=False,
+        )
+        for sec, offset_mm in zip(sections, offsets_per_section)
+    ]
+    return _loft_from_section_profiles(sections, profiles)
+
+
+def build_transtibial_socket_profiles(
+    sections: list[dict[str, Any]],
+    inner_offsets: list[float],
+    *,
+    wall_proximal_mm: float,
+    wall_distal_mm: float,
+    outer_flare_per_section: list[float],
+    extra_wall_per_section: list[float],
+    transtibial_profile: dict[str, Any] | None,
+    neck_transition_fraction: float = DEFAULT_PROSTHESIS_NECK_FRACTION,
+    neck_wall_mm: float = DEFAULT_PROSTHESIS_NECK_WALL_MM,
+    proximal_entry_depth_mm: float = DEFAULT_PROXIMAL_ENTRY_DEPTH_MM,
+) -> tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]]:
+    if len(sections) != len(inner_offsets):
+        raise ValueError("inner_offsets debe alinearse con sections")
+
+    z_min = float(sections[0]["z_mm"])
+    z_max = float(sections[-1]["z_mm"])
+    span = max(z_max - z_min, 1e-6)
+
+    inner_profiles: list[list[tuple[float, float]]] = []
+    outer_profiles: list[list[tuple[float, float]]] = []
+
+    for sec, inner_off, flare_mm, extra_wall in zip(
+        sections, inner_offsets, outer_flare_per_section, extra_wall_per_section
+    ):
+        z_frac = (float(sec["z_mm"]) - z_min) / span
+        wall_mm = interpolate_scalar_at_z(
+            float(sec["z_mm"]), z_min, z_max, wall_distal_mm, wall_proximal_mm
+        )
+        total_wall = max(wall_mm + float(extra_wall), MIN_SHELL_WALL_MM + float(extra_wall))
+
+        z_mm = float(sec["z_mm"])
+        in_entry = _is_proximal_entry_section(z_mm, z_min, z_max, proximal_entry_depth_mm)
+        profile_enabled = bool(transtibial_profile and transtibial_profile.get("enabled", True))
+        apply_profile = profile_enabled and not in_entry
+        inner_pts = _build_section_profile_points(
+            sec,
+            inner_off,
+            z_frac=z_frac,
+            transtibial_profile=transtibial_profile,
+            apply_profile=apply_profile,
+        )
+        outer_pts = offset_points_2d(inner_pts, total_wall + float(flare_mm))
+        outer_pts = _ensure_outer_encloses_inner(inner_pts, outer_pts, total_wall)
+        if z_frac < neck_transition_fraction and z_frac > 1e-6 and not in_entry:
+            neck_blend = 1.0 - z_frac / max(neck_transition_fraction, 1e-6)
+            outer_pts = _blend_outer_toward_neck(
+                outer_pts,
+                inner_pts,
+                blend=neck_blend,
+                neck_wall_mm=neck_wall_mm,
+            )
+        outer_pts = resample_contour(outer_pts, LOFT_CONTOUR_POINTS)
+
+        inner_profiles.append(inner_pts)
+        outer_profiles.append(outer_pts)
+
+    return inner_profiles, outer_profiles
+
+
+def loft_transtibial_socket_shell(
+    sections: list[dict[str, Any]],
+    inner_offsets: list[float],
+    *,
+    wall_proximal_mm: float,
+    wall_distal_mm: float,
+    outer_flare_per_section: list[float],
+    extra_wall_per_section: list[float],
+    transtibial_profile: dict[str, Any] | None,
+) -> cq.Workplane:
+    """Cáscara con pared variable, perfil PTB interior y ensanchamiento proximal exterior."""
+    inner_profiles, outer_profiles = build_transtibial_socket_profiles(
+        sections,
+        inner_offsets,
+        wall_proximal_mm=wall_proximal_mm,
+        wall_distal_mm=wall_distal_mm,
+        outer_flare_per_section=outer_flare_per_section,
+        extra_wall_per_section=extra_wall_per_section,
+        transtibial_profile=transtibial_profile,
+    )
+    outer_body = _loft_from_section_profiles(sections, outer_profiles)
+    inner_body = _loft_from_section_profiles(sections, inner_profiles)
+    return outer_body.cut(inner_body)
+
+
 def loft_shell_from_agent(
     sections: list[dict[str, Any]],
     inner_offsets: list[float],
     wall_thickness_mm: float,
 ) -> cq.Workplane:
+    """Compatibilidad: pared uniforme sin perfil transtibial."""
     outer_offsets = [o + wall_thickness_mm for o in inner_offsets]
     outer_body = _loft_from_sections_per_offset(sections, outer_offsets)
     inner_body = _loft_from_sections_per_offset(sections, inner_offsets)
     return outer_body.cut(inner_body)
+
+
+def _scale_contour_2d(
+    points: list[tuple[float, float]], scale: float
+) -> list[tuple[float, float]]:
+    cx, cy = _contour_centroid(points)
+    return [((x - cx) * scale + cx, (y - cy) * scale + cy) for x, y in points]
+
+
+def _last_section_index_below_z(
+    sections: list[dict[str, Any]], z_limit_mm: float
+) -> int:
+    last_i = 0
+    for i, sec in enumerate(sections):
+        if float(sec["z_mm"]) <= z_limit_mm + 1e-6:
+            last_i = i
+    return last_i
+
+
+def _loft_from_profiles_at_z(
+    profile_z_pairs: list[tuple[float, list[tuple[float, float]]]],
+) -> cq.Workplane | None:
+    """Loft sólido siguiendo contornos en distintos planos Z (superficies no planas)."""
+    if len(profile_z_pairs) < 2:
+        return None
+    ordered = sorted(profile_z_pairs, key=lambda p: p[0])
+    loft_wp: cq.Workplane | None = None
+    prev_z = float(ordered[0][0])
+    for z, pts in ordered:
+        if len(pts) < 3:
+            continue
+        delta = float(z) - prev_z
+        if loft_wp is None:
+            loft_wp = cq.Workplane("XY").workplane(offset=float(z)).polyline(pts).close()
+        else:
+            loft_wp = loft_wp.workplane(offset=delta).polyline(pts).close()
+        prev_z = float(z)
+    if loft_wp is None:
+        return None
+    return loft_wp.loft(combine=True)
+
+
+def _loft_annular_between_profiles(
+    sections: list[dict[str, Any]],
+    inner_profiles: list[list[tuple[float, float]]],
+    outer_profiles: list[list[tuple[float, float]]],
+    start_i: int,
+    end_i: int,
+) -> cq.Workplane | None:
+    if end_i <= start_i:
+        return None
+    sub_secs = sections[start_i : end_i + 1]
+    sub_outer = outer_profiles[start_i : end_i + 1]
+    sub_inner = inner_profiles[start_i : end_i + 1]
+    if len(sub_secs) < 2:
+        return None
+    try:
+        outer_body = _loft_from_section_profiles(sub_secs, sub_outer)
+        inner_body = _loft_from_section_profiles(sub_secs, sub_inner)
+        annulus = outer_body.cut(inner_body)
+        return annulus if _shape_is_valid(annulus) else None
+    except Exception:
+        return None
+
+
+def resolve_proximal_entry_depth_mm(
+    sections: list[dict[str, Any]],
+    geometry: dict[str, Any] | None = None,
+) -> float:
+    """
+    Profundidad de encaje al muñón desde la boca proximal (z_max).
+    Prioriza ~10–12 mm; si hay rodilla cerca, no invade esa zona.
+    """
+    depth = float(DEFAULT_PROXIMAL_ENTRY_DEPTH_MM)
+    if not sections:
+        return depth
+    z_min = float(sections[0]["z_mm"])
+    z_max = float(sections[-1]["z_mm"])
+    span = max(z_max - z_min, 1e-6)
+    knee = (geometry or {}).get("knee_landmark") or {}
+    knee_z = knee.get("suggested_trim_height_mm") or knee.get("area_break_z_mm")
+    if knee_z is not None:
+        margin = max(span * 0.08, 15.0)
+        max_depth = float(knee_z) - z_min - margin
+        if max_depth > 6.0:
+            depth = min(depth, max_depth)
+    return float(np.clip(depth, 8.0, MAX_PROXIMAL_ENTRY_DEPTH_MM))
+
+
+def _is_proximal_entry_section(
+    z_mm: float, z_min: float, z_max: float, entry_depth_mm: float
+) -> bool:
+    return float(z_mm) >= float(z_max) - float(entry_depth_mm) - 1e-6
+
+
+def _index_distal_anchor_section(sections: list[dict[str, Any]]) -> int:
+    """Cuello distal (prótesis): siempre en el extremo z_min (primeras secciones)."""
+    if not sections:
+        return 0
+    n = min(DISTAL_ANCHOR_MAX_SECTIONS, len(sections))
+    best_i = 0
+    best_a = float("inf")
+    for i in range(n):
+        area = float(sections[i].get("area_mm2", 0) or 0)
+        if area > 0 and area < best_a:
+            best_a = area
+            best_i = i
+    return best_i
+
+
+def _index_min_area_section(sections: list[dict[str, Any]]) -> int:
+    """Índice de la sección con menor área (cuello distal / encaje prótesis)."""
+    return _index_distal_anchor_section(sections)
+
+
+def _ensure_outer_encloses_inner(
+    inner_pts: list[tuple[float, float]],
+    outer_pts: list[tuple[float, float]],
+    min_gap_mm: float,
+) -> list[tuple[float, float]]:
+    """Evita contornos cruzados (outer más pequeño que inner) que generan mallas mezcladas."""
+    r_inner = _mean_contour_radius(inner_pts)
+    r_outer = _mean_contour_radius(outer_pts)
+    need = r_inner + max(min_gap_mm, MIN_SHELL_WALL_MM * 0.5)
+    if r_outer >= need:
+        return outer_pts
+    cx, cy = _contour_centroid(inner_pts)
+    scale = need / max(r_outer, 1e-6)
+    return [
+        (cx + (x - cx) * scale, cy + (y - cy) * scale)
+        for x, y in outer_pts
+    ]
+
+
+def open_proximal_end(
+    model: cq.Workplane,
+    sections: list[dict[str, Any]],
+    *,
+    clearance_mm: float = 1.0,
+) -> cq.Workplane:
+    """Boca proximal (+Z) abierta: elimina cualquier tapa por encima de la última sección."""
+    if not sections or not _shape_is_valid(model):
+        return model
+    try:
+        z_base = float(sections[0]["z_mm"])
+        z_top = float(sections[-1]["z_mm"]) - z_base
+        span_xy = 800.0
+        cutter = (
+            cq.Workplane("XY")
+            .workplane(offset=z_top + clearance_mm)
+            .box(span_xy, span_xy, 500.0, centered=(True, True, False))
+        )
+        opened = model.cut(cutter)
+        return opened if _shape_is_valid(opened) else model
+    except Exception:
+        return model
+
+
+def _mean_contour_radius(points: list[tuple[float, float]]) -> float:
+    cx, cy = _contour_centroid(points)
+    radii = [math.hypot(x - cx, y - cy) for x, y in points]
+    return float(np.mean(radii)) if radii else 0.0
+
+
+def _circle_contour_points(
+    cx: float, cy: float, radius: float, *, n: int = LOFT_CONTOUR_POINTS
+) -> list[tuple[float, float]]:
+    if radius <= 1e-6:
+        radius = 1.0
+    return [
+        (cx + radius * math.cos(2.0 * math.pi * i / n), cy + radius * math.sin(2.0 * math.pi * i / n))
+        for i in range(n)
+    ]
+
+
+def zero_proximal_envelope(n_sections: int) -> tuple[list[float], list[float]]:
+    """Encaje proximal simple: sin flare/collar ni refuerzo sólido en la boca."""
+    return [0.0] * n_sections, [0.0] * n_sections
+
+
+def _blend_outer_toward_neck(
+    outer_pts: list[tuple[float, float]],
+    inner_pts: list[tuple[float, float]],
+    *,
+    blend: float,
+    neck_wall_mm: float,
+) -> list[tuple[float, float]]:
+    """Suaviza el contorno exterior hacia un cuello circular (interfaz prótesis, z distal)."""
+    blend = float(np.clip(blend, 0.0, 1.0))
+    if blend <= 1e-6:
+        return outer_pts
+    cx, cy = _contour_centroid(inner_pts)
+    r_inner = _mean_contour_radius(inner_pts)
+    r_outer = _mean_contour_radius(outer_pts)
+    r_target = max(r_inner + neck_wall_mm, r_outer * 0.88)
+    blended: list[tuple[float, float]] = []
+    for x, y in outer_pts:
+        angle = math.atan2(y - cy, x - cx)
+        tx = cx + r_target * math.cos(angle)
+        ty = cy + r_target * math.sin(angle)
+        blended.append(((1.0 - blend) * x + blend * tx, (1.0 - blend) * y + blend * ty))
+    return resample_contour(blended, LOFT_CONTOUR_POINTS)
+
+
+def add_prosthesis_adapter_solid(
+    model: cq.Workplane,
+    sections: list[dict[str, Any]],
+    inner_profiles: list[list[tuple[float, float]]],
+    outer_profiles: list[list[tuple[float, float]]],
+    *,
+    solid_height_mm: float,
+    cap_ring_mm: float,
+    core_fill_fraction: float = DEFAULT_DISTAL_CORE_FILL_FRACTION,
+    core_max_z_fraction: float = DEFAULT_DISTAL_CORE_MAX_Z_FRACTION,
+    adapter_diameter_mm: float = DEFAULT_PROSTHESIS_ADAPTER_DIAMETER_MM,
+    adapter_plate_mm: float = DEFAULT_PROSTHESIS_ADAPTER_PLATE_MM,
+) -> cq.Workplane:
+    """
+    Cierra el extremo distal (menor área) con sólido para acople de prótesis.
+
+    - Tapa anular (+Z) en el cuello: une pared interior y exterior.
+    - Plug hacia -Z: transición anatómica → cuello circular estándar de prótesis.
+    - Placa circular inferior: superficie plana de encaje con adaptador piramidal.
+    """
+    del core_fill_fraction, core_max_z_fraction
+    if solid_height_mm <= 0 or not inner_profiles or not outer_profiles or not sections:
+        return model
+    if len(sections) != len(inner_profiles):
+        return model
+
+    dist_idx = _index_min_area_section(sections)
+    inner_pts = inner_profiles[dist_idx]
+    outer_pts = outer_profiles[dist_idx]
+    if len(inner_pts) < 3 or len(outer_pts) < 3:
+        return model
+
+    try:
+        z_base = float(sections[0]["z_mm"])
+        z_anchor = float(sections[dist_idx]["z_mm"]) - z_base
+        result = model
+        inner_wp = cq.Workplane("XY").workplane(offset=z_anchor).polyline(inner_pts).close()
+        outer_wp = cq.Workplane("XY").workplane(offset=z_anchor).polyline(outer_pts).close()
+
+        if cap_ring_mm > 0:
+            # Hacia -Z (distal): no rellenar la cavidad hacia proximal (+Z)
+            seal = outer_wp.cut(inner_wp).extrude(-abs(cap_ring_mm))
+            if _shape_is_valid(seal):
+                result = result.union(seal)
+
+        cx, cy = _contour_centroid(inner_pts)
+        r_neck = _mean_contour_radius(inner_pts)
+        r_adapter = max(float(adapter_diameter_mm) / 2.0, r_neck * 0.92)
+
+        plug_pairs: list[tuple[float, list[tuple[float, float]]]] = []
+        tiers = max(4, DEFAULT_PLUG_TAPER_TIERS)
+        for k in range(tiers):
+            t = k / max(tiers - 1, 1)
+            z_off = z_anchor - solid_height_mm * t
+            if t < 0.45:
+                scale = 1.0 - 0.10 * t
+                pts = resample_contour(_scale_contour_2d(inner_pts, scale), LOFT_CONTOUR_POINTS)
+            else:
+                blend = (t - 0.45) / 0.55
+                anatomical = resample_contour(
+                    _scale_contour_2d(inner_pts, max(0.78, 1.0 - 0.12 * t)), LOFT_CONTOUR_POINTS
+                )
+                circular = _circle_contour_points(cx, cy, r_adapter * (1.0 - 0.06 * t))
+                pts = [
+                    (
+                        (1.0 - blend) * ax + blend * bx,
+                        (1.0 - blend) * ay + blend * by,
+                    )
+                    for (ax, ay), (bx, by) in zip(anatomical, circular)
+                ]
+            plug_pairs.append((z_off, pts))
+
+        plug = _loft_from_profiles_at_z(plug_pairs)
+        if plug is not None and _shape_is_valid(plug):
+            result = result.union(plug)
+
+        plate_h = max(float(adapter_plate_mm), 2.0)
+        z_plate = z_anchor - solid_height_mm - plate_h
+        plate = (
+            cq.Workplane("XY")
+            .workplane(offset=z_plate)
+            .circle(r_adapter)
+            .extrude(plate_h)
+        )
+        if _shape_is_valid(plate):
+            result = result.union(plate)
+
+        return result
+    except Exception:
+        return model
+
+
+def _resolve_transtibial_profile(
+    structure: dict[str, Any],
+    design_parameters: dict[str, Any],
+) -> dict[str, Any]:
+    profile = dict(structure.get("transtibial_profile") or design_parameters.get("transtibial_profile") or {})
+    adapter = structure.get("proximal_adapter") or design_parameters.get("proximal_adapter") or {}
+    defaults = {
+        "enabled": True,
+        "patellar_bar_depth_mm": DEFAULT_PATELLAR_BAR_DEPTH_MM,
+        "posterior_relief_mm": DEFAULT_POSTERIOR_RELIEF_MM,
+        "lateral_flare_mm": 2.5,
+    }
+    defaults.update(profile)
+    defaults["proximal_adapter"] = {
+        "enabled": False,
+        "flare_mm": 0.0,
+        "flare_height_fraction": 0.0,
+        "collar_height_mm": 0.0,
+        "collar_extra_wall_mm": 0.0,
+    }
+    return defaults
+
+
+def _resolve_prosthesis_adapter(
+    structure: dict[str, Any], design_parameters: dict[str, Any]
+) -> dict[str, Any]:
+    """Adaptador sólido en extremo distal (z=0, encaje con prótesis)."""
+    adapter = dict(
+        structure.get("prosthesis_adapter")
+        or design_parameters.get("prosthesis_adapter")
+        or structure.get("distal_closure")
+        or design_parameters.get("distal_closure")
+        or {}
+    )
+    return {
+        "enabled": bool(adapter.get("enabled", True)),
+        "solid_height_mm": float(
+            adapter.get("solid_height_mm", DEFAULT_PROSTHESIS_ADAPTER_HEIGHT_MM)
+        ),
+        "cap_ring_mm": float(
+            adapter.get("cap_ring_mm", adapter.get("cap_thickness_mm", DEFAULT_DISTAL_CAP_MM))
+        ),
+        "core_fill_fraction": float(
+            adapter.get("core_fill_fraction", DEFAULT_DISTAL_CORE_FILL_FRACTION)
+        ),
+        "core_max_z_fraction": float(
+            adapter.get("core_max_z_fraction", DEFAULT_DISTAL_CORE_MAX_Z_FRACTION)
+        ),
+        "neck_transition_fraction": float(
+            adapter.get("neck_transition_fraction", DEFAULT_PROSTHESIS_NECK_FRACTION)
+        ),
+        "neck_wall_mm": float(adapter.get("neck_wall_mm", DEFAULT_PROSTHESIS_NECK_WALL_MM)),
+        "adapter_diameter_mm": float(
+            adapter.get("adapter_diameter_mm", DEFAULT_PROSTHESIS_ADAPTER_DIAMETER_MM)
+        ),
+        "adapter_plate_mm": float(
+            adapter.get("adapter_plate_mm", DEFAULT_PROSTHESIS_ADAPTER_PLATE_MM)
+        ),
+    }
+
+
+def _resolve_distal_closure(structure: dict[str, Any], design_parameters: dict[str, Any]) -> dict[str, Any]:
+    closure = dict(structure.get("distal_closure") or design_parameters.get("distal_closure") or {})
+    return {
+        "enabled": bool(closure.get("enabled", True)),
+        "cap_thickness_mm": float(closure.get("cap_thickness_mm", DEFAULT_DISTAL_CAP_MM)),
+    }
 
 
 def _validate_agent_response(agent_response: dict[str, Any]) -> dict[str, Any]:
@@ -454,8 +1208,12 @@ def generate_socket_from_agent(
     local_mods = list(socket_spec.get("local_modifications") or [])
     wall = structure.get("wall_thickness_mm") or {}
     wall_prox = float(wall.get("proximal", DEFAULT_WALL_THICKNESS_MM))
-    wall_dist = float(wall.get("distal", DEFAULT_WALL_THICKNESS_MM))
-    wall_used = max(wall_prox, wall_dist)
+    wall_dist = float(wall.get("distal", DEFAULT_WALL_THICKNESS_DISTAL_MM))
+
+    design_parameters = agent.get("design_parameters") or {}
+    transtibial_profile = _resolve_transtibial_profile(structure, design_parameters)
+    prosthesis_adapter = _resolve_prosthesis_adapter(structure, design_parameters)
+    adapter = transtibial_profile.get("proximal_adapter") or {}
 
     height_mm = float(geometry.get("height_mm") or agent.get("geometry_reference", {}).get("height_mm", 0))
     length_fraction = float(structure.get("socket_length_fraction", DEFAULT_SOCKET_LENGTH_FRACTION))
@@ -469,6 +1227,8 @@ def generate_socket_from_agent(
 
     sections = filter_valid_sections(geometry["sections"])
     sections, length_meta = apply_socket_length(sections, height_mm, length_fraction)
+    proximal_entry_depth_mm = resolve_proximal_entry_depth_mm(sections, geometry)
+    sections = subsample_sections_for_loft(sections)
 
     base_per_section = [
         interpolate_offset_at_z(float(s["z_mm"]), samples, base_offsets.get("interpolation", "linear"))
@@ -478,10 +1238,63 @@ def generate_socket_from_agent(
         sections, base_per_section, local_mods, height_mm
     )
 
-    fillet_mm = float(agent.get("design_parameters", {}).get("proximal_fillet_mm", DEFAULT_PROXIMAL_FILLET_MM))
+    fillet_mm = 0.0 if PROXIMAL_SIMPLE_FIT else float(
+        design_parameters.get("proximal_fillet_mm", DEFAULT_PROXIMAL_FILLET_MM)
+    )
 
-    model = loft_shell_from_agent(sections, inner_offsets, wall_used)
-    model = apply_proximal_fillet(model, fillet_mm)
+    if PROXIMAL_SIMPLE_FIT:
+        outer_flares, extra_walls = zero_proximal_envelope(len(sections))
+    else:
+        outer_flares, extra_walls = compute_proximal_envelope_per_section(
+            sections,
+            flare_mm=float(adapter.get("flare_mm", DEFAULT_PROXIMAL_FLARE_MM)),
+            flare_height_fraction=float(
+                adapter.get("flare_height_fraction", DEFAULT_PROXIMAL_FLARE_HEIGHT_FRACTION)
+            ),
+            collar_height_mm=float(adapter.get("collar_height_mm", DEFAULT_ADAPTER_COLLAR_HEIGHT_MM)),
+            collar_extra_wall_mm=float(
+                adapter.get("collar_extra_wall_mm", DEFAULT_ADAPTER_COLLAR_EXTRA_WALL_MM)
+            ),
+        )
+
+    inner_profiles, outer_profiles = [], []
+    model, (inner_profiles, outer_profiles), cad_fallback_notes = _build_socket_shell(
+        sections,
+        inner_offsets,
+        wall_proximal_mm=wall_prox,
+        wall_distal_mm=wall_dist,
+        transtibial_profile=transtibial_profile,
+        outer_flares=outer_flares,
+        extra_walls=extra_walls,
+        neck_transition_fraction=prosthesis_adapter["neck_transition_fraction"],
+        neck_wall_mm=prosthesis_adapter["neck_wall_mm"],
+        proximal_entry_depth_mm=proximal_entry_depth_mm,
+    )
+    mods_log.extend(cad_fallback_notes)
+
+    if prosthesis_adapter.get("enabled", True) and inner_profiles and outer_profiles:
+        model = add_prosthesis_adapter_solid(
+            model,
+            sections,
+            inner_profiles,
+            outer_profiles,
+            solid_height_mm=float(prosthesis_adapter["solid_height_mm"]),
+            cap_ring_mm=float(prosthesis_adapter["cap_ring_mm"]),
+            core_fill_fraction=float(
+                prosthesis_adapter.get("core_fill_fraction", DEFAULT_DISTAL_CORE_FILL_FRACTION)
+            ),
+            core_max_z_fraction=float(
+                prosthesis_adapter.get("core_max_z_fraction", DEFAULT_DISTAL_CORE_MAX_Z_FRACTION)
+            ),
+            adapter_diameter_mm=float(prosthesis_adapter.get("adapter_diameter_mm", DEFAULT_PROSTHESIS_ADAPTER_DIAMETER_MM)),
+            adapter_plate_mm=float(prosthesis_adapter.get("adapter_plate_mm", DEFAULT_PROSTHESIS_ADAPTER_PLATE_MM)),
+        )
+
+    if PROXIMAL_SIMPLE_FIT and sections:
+        model = open_proximal_end(model, sections)
+
+    if not PROXIMAL_SIMPLE_FIT:
+        model = apply_proximal_fillet(model, fillet_mm)
 
     bbox = compute_bbox_mm(model)
     socket_volume = approximate_volume_cm3(model)
@@ -503,12 +1316,28 @@ def generate_socket_from_agent(
     if clinical.get("contraindications"):
         warnings.extend(str(c) for c in clinical["contraindications"])
 
+    if not _shape_is_valid(model):
+        raise ValueError("Null TopoDS_Shape object")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     stl_path = out_dir / "socket.stl"
+    ply_path = out_dir / "socket.ply"
     step_path = out_dir / "socket.step"
     script_copy = out_dir / "socket_design.cad.py"
 
-    cq.exporters.export(model, str(stl_path))
+    try:
+        stl_meta = export_socket_stl(model, stl_path)
+    except Exception as exc:
+        raise ValueError(f"Export STL fallido: {exc}") from exc
+
+    ply_meta: dict[str, Any] | None = None
+    try:
+        from app.services.mesh_convert import convert_stl_file_to_ply
+
+        ply_meta = convert_stl_file_to_ply(stl_path, ply_path)
+    except Exception as exc:
+        warnings.append(f"Export PLY omitido: {exc}")
+
     step_exported = False
     try:
         cq.exporters.export(model, str(step_path))
@@ -542,12 +1371,42 @@ def generate_socket_from_agent(
             "wall_thickness_mm": {
                 "proximal": wall_prox,
                 "distal": wall_dist,
-                "used_for_loft": wall_used,
+                "mode": "interpolated_distal_to_proximal",
             },
+            "proximal_adapter": {
+                "mode": "simple_fit" if PROXIMAL_SIMPLE_FIT else "flare_collar",
+                "flare_mm": 0.0 if PROXIMAL_SIMPLE_FIT else float(adapter.get("flare_mm", DEFAULT_PROXIMAL_FLARE_MM)),
+                "flare_height_fraction": 0.0 if PROXIMAL_SIMPLE_FIT else float(
+                    adapter.get("flare_height_fraction", DEFAULT_PROXIMAL_FLARE_HEIGHT_FRACTION)
+                ),
+                "collar_height_mm": 0.0 if PROXIMAL_SIMPLE_FIT else float(
+                    adapter.get("collar_height_mm", DEFAULT_ADAPTER_COLLAR_HEIGHT_MM)
+                ),
+                "collar_extra_wall_mm": 0.0 if PROXIMAL_SIMPLE_FIT else float(
+                    adapter.get("collar_extra_wall_mm", DEFAULT_ADAPTER_COLLAR_EXTRA_WALL_MM)
+                ),
+                "max_outer_flare_mm": round(max(outer_flares) if outer_flares else 0.0, 3),
+                "max_extra_wall_mm": round(max(extra_walls) if extra_walls else 0.0, 3),
+            },
+            "transtibial_profile": {
+                "enabled": bool(transtibial_profile.get("enabled", True)),
+                "patellar_bar_depth_mm": float(
+                    transtibial_profile.get("patellar_bar_depth_mm", DEFAULT_PATELLAR_BAR_DEPTH_MM)
+                ),
+                "posterior_relief_mm": float(
+                    transtibial_profile.get("posterior_relief_mm", DEFAULT_POSTERIOR_RELIEF_MM)
+                ),
+            },
+            "prosthesis_adapter": prosthesis_adapter,
+            "distal_closure": prosthesis_adapter,
             "socket_length_fraction": length_fraction,
             "sections_input": len(geometry.get("sections", [])),
             "sections_loft": len(sections),
-            "length_processing": length_meta,
+            "length_processing": {
+                **length_meta,
+                "knee_landmark": geometry.get("knee_landmark"),
+                "trim_height_mm": round(float(structure.get("trim_height_mm", 0) or 0), 3),
+            },
             "ventilation": {
                 "enabled": bool(ventilation.get("enabled", False)),
                 "pattern": ventilation.get("pattern"),
@@ -555,6 +1414,10 @@ def generate_socket_from_agent(
                 "note": "no mesh in MVP" if ventilation.get("enabled") else None,
             },
             "proximal_fillet_mm": fillet_mm,
+            "proximal_stump_fit": {
+                "mode": "open_contour" if PROXIMAL_SIMPLE_FIT else "standard",
+                "entry_depth_mm": round(proximal_entry_depth_mm, 3),
+            },
         },
         "geometry_checks": {
             "height_mm_stump": height_mm,
@@ -563,6 +1426,12 @@ def generate_socket_from_agent(
             "volume_stump_cm3": geometry.get("volume_cm3"),
             "volume_socket_cm3": socket_volume,
             "bbox_mm": bbox,
+            "stl_export": stl_meta,
+            "ply_export": ply_meta,
+            "orientation": {
+                "distal_prosthesis": "z_min (-Z en vista estándar Blender)",
+                "proximal_stump": "z_max (+Z)",
+            },
             "height_coherence": height_check,
             "reconstruction_error": geometry.get("reconstruction_error"),
             "section_similarity": geometry.get("section_similarity"),
@@ -574,6 +1443,7 @@ def generate_socket_from_agent(
         ),
         "exports": {
             "stl": str(stl_path.name),
+            "ply": str(ply_path.name) if ply_meta else None,
             "step": str(step_path.name) if step_exported else None,
             "report": "agent_cad_report.json",
             "script": str(script_copy.name),
@@ -587,16 +1457,36 @@ def generate_socket_from_agent(
 
 
 def apply_proximal_fillet(model: cq.Workplane, fillet_mm: float) -> cq.Workplane:
-    if fillet_mm <= 0:
+    if fillet_mm <= 0 or not _shape_is_valid(model):
         return model
     try:
         bbox = model.val().BoundingBox()
         z_max = bbox.zmax
-        # Seleccionar aristas cercanas al borde proximal (apertura superior)
         result = model.edges(f"|Z| > {z_max - 0.5}").fillet(fillet_mm)
-        return result
+        return result if _shape_is_valid(result) else model
     except Exception:
         return model
+
+
+def export_socket_stl(model: cq.Workplane, stl_path: Path) -> dict[str, Any]:
+    """Exporta STL en mm y valida la escala del archivo (evita ×1000 en visores)."""
+    cq.exporters.export(model, str(stl_path))
+    meta: dict[str, Any] = {"stl_units": "mm", "path": stl_path.name}
+    try:
+        import trimesh
+
+        tm = trimesh.load(stl_path)
+        extents = [round(float(x), 3) for x in tm.extents.tolist()]
+        meta["stl_extent_mm"] = extents
+        max_ext = max(extents) if extents else 0.0
+        if max_ext > _MAX_STL_EXTENT_MM:
+            raise ValueError(
+                f"STL con extent {max_ext:.1f} mm (> {_MAX_STL_EXTENT_MM}): "
+                "re-analiza el escaneo (unidades) o revisa geometry_analysis."
+            )
+    except ImportError:
+        meta["stl_validation"] = "trimesh no disponible"
+    return meta
 
 
 def compute_bbox_mm(model: cq.Workplane) -> dict[str, float]:
@@ -648,7 +1538,11 @@ def print_summary(payload: dict[str, Any]) -> None:
         print(f"Holgura radial: {params.get('radial_clearance_mm')} mm")
     if cad_exec.get("wall_thickness_mm"):
         wt = cad_exec["wall_thickness_mm"]
-        print(f"Espesor pared (loft): {wt.get('used_for_loft')} mm")
+        mode = wt.get("mode", "uniform")
+        if mode == "interpolated_distal_to_proximal":
+            print(f"Espesor pared: distal {wt.get('distal')} mm → proximal {wt.get('proximal')} mm")
+        else:
+            print(f"Espesor pared (loft): {wt.get('used_for_loft', wt.get('proximal'))} mm")
     if cad_exec.get("socket_length_fraction") is not None:
         print(f"Longitud socket: {cad_exec['socket_length_fraction']:.0%} de height_mm")
     elif params.get("socket_length_fraction") is not None:

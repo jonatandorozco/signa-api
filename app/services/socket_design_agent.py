@@ -15,6 +15,12 @@ import numpy as np
 
 from app.schemas.geometry import GeometryResponse
 from app.schemas.socket_design import SocketDesignAgentResponse
+from app.services.clinical_preferences import (
+    TRANSTIBIAL_DEFAULT_LENGTH_FRACTION,
+    cap_transtibial_length_fraction,
+    is_transtibial_report,
+)
+from app.services.mesh_analyzer import resolve_socket_trim_from_geometry
 from app.services.socket_design_merge import finalize_agent_payload
 
 DATOS_REPORTE_PATH = Path(__file__).resolve().parent.parent / "data" / "datos_reporte.json"
@@ -132,7 +138,7 @@ def _build_offset_samples(
 
 
 def _build_local_modifications(
-    height_mm: float,
+    socket_top_z_mm: float,
     report: dict[str, Any],
     clearance_mm: float,
 ) -> list[dict[str, Any]]:
@@ -146,7 +152,7 @@ def _build_local_modifications(
             {
                 "kind": "relief",
                 "z_min_mm": 0.0,
-                "z_max_mm": round(height_mm * 0.3, 3),
+                "z_max_mm": round(socket_top_z_mm * 0.3, 3),
                 "angle_start_deg": 0.0,
                 "angle_end_deg": 360.0,
                 "depth_mm": round(max(1.0, clearance_mm * 0.5), 2),
@@ -160,8 +166,8 @@ def _build_local_modifications(
         mods.append(
             {
                 "kind": "ventilation_channel",
-                "z_min_mm": round(height_mm * 0.2, 3),
-                "z_max_mm": round(height_mm * 0.85, 3),
+                "z_min_mm": round(socket_top_z_mm * 0.2, 3),
+                "z_max_mm": round(socket_top_z_mm * 0.82, 3),
                 "angle_start_deg": 80.0,
                 "angle_end_deg": 100.0,
                 "depth_mm": 2.0,
@@ -169,7 +175,42 @@ def _build_local_modifications(
             }
         )
 
+    mods.extend(_default_transtibial_modifications(socket_top_z_mm))
     return mods
+
+
+def _default_transtibial_modifications(socket_top_z_mm: float) -> list[dict[str, Any]]:
+    """Modificaciones PTB base si el agente no las define explícitamente (z relativo al tope del socket)."""
+    top = max(socket_top_z_mm, 1.0)
+    return [
+        {
+            "kind": "build_up",
+            "z_min_mm": round(top * 0.35, 3),
+            "z_max_mm": round(top * 0.75, 3),
+            "angle_start_deg": 330.0,
+            "angle_end_deg": 30.0,
+            "depth_mm": 1.2,
+            "clinical_reason": "barra rotuliana PTB — contacto anterior controlado",
+        },
+        {
+            "kind": "relief",
+            "z_min_mm": round(top * 0.28, 3),
+            "z_max_mm": round(top * 0.88, 3),
+            "angle_start_deg": 150.0,
+            "angle_end_deg": 210.0,
+            "depth_mm": 0.9,
+            "clinical_reason": "alivio posterior para flexión de rodilla (no subir a zona de rodilla)",
+        },
+        {
+            "kind": "relief",
+            "z_min_mm": round(top * 0.50, 3),
+            "z_max_mm": round(top * 0.85, 3),
+            "angle_start_deg": 240.0,
+            "angle_end_deg": 300.0,
+            "depth_mm": 0.5,
+            "clinical_reason": "holgura lateral proximal en borde superior del socket",
+        },
+    ]
 
 
 def _compute_fit_confidence(geometry: dict[str, Any], report: dict[str, Any]) -> float:
@@ -256,20 +297,42 @@ def _build_clinical_reasoning(
     }
 
 
-def _derive_structure_params(report: dict[str, Any], height_mm: float) -> dict[str, Any]:
-    prefs = report.get("design_preferences") or {}
-    priorities = [str(p).lower() for p in prefs.get("top_priorities", [])]
+def _derive_structure_params(
+    report: dict[str, Any], height_mm: float, geometry: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    design_prefs = report.get("design_preferences") or {}
+    priorities = [str(p).lower() for p in design_prefs.get("top_priorities", [])]
     activity = str(_report_get(report, "functional_goals", "activity_level", default="")).lower()
 
-    wall_prox, wall_dist = 4.0, 6.0
+    wall_prox, wall_dist = 3.5, 4.0
     if "resistencia" in priorities:
-        wall_prox, wall_dist = 5.0, 7.0
+        wall_prox, wall_dist = 4.0, 4.5
 
-    length_fraction = 0.85
+    transtibial = is_transtibial_report(report)
+    default_fraction = TRANSTIBIAL_DEFAULT_LENGTH_FRACTION if transtibial else 0.85
     residual = report.get("residual_limb_status") or {}
     pain_score = float(residual.get("pain_score_0_10", 0) or 0)
     if pain_score >= 3 or "distal" in str(residual.get("sensitivity_areas", "")).lower():
-        length_fraction = 0.78
+        default_fraction = 0.76 if transtibial else 0.78
+
+    socket_prefs = report.get("socket_preferences") or {}
+    explicit_frac = (
+        float(socket_prefs["socket_length_fraction"])
+        if "socket_length_fraction" in socket_prefs
+        else None
+    )
+    explicit_trim = float(socket_prefs["trim_height_mm"]) if socket_prefs.get("trim_height_mm") else None
+    trim_mm, length_fraction, _trim_source = resolve_socket_trim_from_geometry(
+        geometry or {},
+        height_mm,
+        default_fraction=default_fraction,
+        explicit_fraction=explicit_frac,
+        explicit_trim_mm=explicit_trim,
+        use_knee_detection=transtibial and explicit_frac is None and explicit_trim is None,
+    )
+    length_fraction = cap_transtibial_length_fraction(length_fraction, report)
+    if abs(length_fraction * height_mm - trim_mm) > 0.5:
+        trim_mm = round(height_mm * length_fraction, 3)
 
     env = _report_get(report, "functional_goals", "environment", default=[]) or []
     hot_climate = any("caluroso" in str(e).lower() for e in env)
@@ -283,9 +346,38 @@ def _derive_structure_params(report: dict[str, Any], height_mm: float) -> dict[s
 
     return {
         "wall_thickness_mm": {"proximal": wall_prox, "distal": wall_dist},
-        "trim_height_mm": round(height_mm * length_fraction, 3),
-        "socket_length_fraction": length_fraction,
+        "trim_height_mm": round(trim_mm, 3),
+        "socket_length_fraction": round(length_fraction, 4),
+        "knee_landmark": (geometry or {}).get("knee_landmark"),
         "ventilation": ventilation,
+        "proximal_adapter": {
+            "enabled": False,
+            "flare_mm": 0.0,
+            "flare_height_fraction": 0.0,
+            "collar_height_mm": 0.0,
+            "collar_extra_wall_mm": 0.0,
+        },
+        "transtibial_profile": {
+            "enabled": True,
+            "patellar_bar_depth_mm": 2.0,
+            "posterior_relief_mm": 0.8,
+            "lateral_flare_mm": 2.5,
+        },
+        "prosthesis_adapter": {
+            "enabled": True,
+            "solid_height_mm": 28.0,
+            "cap_ring_mm": 3.0,
+            "neck_transition_fraction": 0.10,
+            "neck_wall_mm": 3.5,
+            "adapter_diameter_mm": 38.0,
+            "adapter_plate_mm": 10.0,
+        },
+        "distal_closure": {
+            "enabled": True,
+            "cap_thickness_mm": 3.0,
+            "solid_height_mm": 28.0,
+            "cap_ring_mm": 3.0,
+        },
         "recommended_material": material,
     }
 
@@ -303,7 +395,7 @@ def run_socket_design_agent(
     section_count = len([s for s in sections if int(s.get("contour_point_count", 0)) >= 3])
 
     clearance = _derive_clearance_mm(geo, report, quality)
-    structure = _derive_structure_params(report, height_mm)
+    structure = _derive_structure_params(report, height_mm, geo)
     fit_confidence = _compute_fit_confidence(geo, report)
     residual = report.get("residual_limb_status") or {}
 
@@ -318,11 +410,13 @@ def run_socket_design_agent(
         },
     }
 
+    recon = geo.get("reconstruction_error") or {}
     agent_quality = {
         "passed": quality["passed"],
         "demo_eligible": quality["demo_eligible"],
         "mean_error_mm": round(quality["mean_error_mm"], 4),
         "max_error_mm": round(quality["max_error_mm"], 4),
+        "p95_error_mm": round(float(recon.get("p95_error_mm", quality["max_error_mm"])), 4),
         "section_similarity": round(quality["section_similarity"], 4),
         "volume_cm3": quality["volume_cm3"],
         "volume_estimated": quality["volume_estimated"],
@@ -341,8 +435,11 @@ def run_socket_design_agent(
         "load sections[].contour per z_mm",
         "apply base_offsets.samples interpolated by z",
         "apply local_modifications by z range and angle",
-        "loft inner solid",
-        "shell outer with wall_thickness_mm",
+        "apply transtibial PTB angular profile on inner surface",
+        "trim socket length below knee flexion zone (socket_length_fraction)",
+        "loft thin shell distal→proximal; z_max = stump entry, z_min = prosthesis",
+        "add proximal rim flare at z_max (stump opening only)",
+        "solid prosthesis adapter at z_min (-Z): closed distal",
     ]
     if quality["blocked"]:
         handoff_steps = ["BLOQUEADO: quality_gate no aprobado — corregir escaneo o malla"]
@@ -379,12 +476,18 @@ def run_socket_design_agent(
                     bool(residual.get("volume_changes_reported")),
                 ),
             },
-            "local_modifications": _build_local_modifications(height_mm, report, clearance),
+            "local_modifications": _build_local_modifications(
+                structure["trim_height_mm"], report, clearance
+            ),
             "structure": {
                 "wall_thickness_mm": structure["wall_thickness_mm"],
                 "trim_height_mm": structure["trim_height_mm"],
                 "socket_length_fraction": structure["socket_length_fraction"],
                 "ventilation": structure["ventilation"],
+                "proximal_adapter": structure["proximal_adapter"],
+                "transtibial_profile": structure["transtibial_profile"],
+                "distal_closure": structure["distal_closure"],
+                "prosthesis_adapter": structure["prosthesis_adapter"],
             },
             "recommended_material": structure["recommended_material"],
             "fit_confidence": fit_confidence,

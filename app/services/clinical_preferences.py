@@ -4,8 +4,78 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.mesh_analyzer import resolve_socket_trim_from_geometry
+
 _OFFSET_SAMPLE_STEP_MM = 5.0
-_LENGTH_PREF_MAP = {"shorter": 0.78, "standard": 0.85, "longer": 0.92}
+_LENGTH_PREF_MAP = {"shorter": 0.76, "standard": 0.80, "longer": 0.85}
+TRANSTIBIAL_MAX_LENGTH_FRACTION = 0.85
+TRANSTIBIAL_DEFAULT_LENGTH_FRACTION = 0.80
+
+
+def is_transtibial_report(clinical_report: dict[str, Any]) -> bool:
+    """True si el caso es transtibial (debajo de rodilla)."""
+    amp = clinical_report.get("amputation_profile") or {}
+    text = " ".join(
+        str(amp.get(key, "")).lower()
+        for key in ("level_interpreted", "level_reported", "limb")
+    )
+    return any(
+        token in text
+        for token in (
+            "transtibial",
+            "transtib",
+            "debajo de la rodilla",
+            "below knee",
+            "below-knee",
+            "bka",
+        )
+    )
+
+
+def cap_transtibial_length_fraction(fraction: float, clinical_report: dict[str, Any]) -> float:
+    """Evita socket que suba hacia la rodilla (no cubrir muslo/cadera)."""
+    if is_transtibial_report(clinical_report):
+        return min(float(fraction), TRANSTIBIAL_MAX_LENGTH_FRACTION)
+    return float(fraction)
+
+
+def _clamp_modifications_to_socket_height(
+    mods: list[dict[str, Any]], socket_top_z_mm: float
+) -> list[dict[str, Any]]:
+    """Asegura que z_max_mm no exceda el borde proximal recortado del socket."""
+    top = max(socket_top_z_mm, 1.0)
+    clamped: list[dict[str, Any]] = []
+    for mod in mods:
+        item = dict(mod)
+        z_min = float(item.get("z_min_mm", 0))
+        z_max = float(item.get("z_max_mm", top))
+        item["z_min_mm"] = round(min(z_min, top - 1.0), 3)
+        item["z_max_mm"] = round(min(max(z_max, item["z_min_mm"] + 1.0), top), 3)
+        clamped.append(item)
+    return clamped
+
+
+def _ensure_posterior_knee_relief(
+    mods: list[dict[str, Any]], socket_top_z_mm: float
+) -> list[dict[str, Any]]:
+    """Alivio posterior en tercio proximal del socket (flexión de rodilla)."""
+    top = max(socket_top_z_mm, 1.0)
+    for mod in mods:
+        if mod.get("kind") == "relief" and float(mod.get("angle_start_deg", 0)) <= 160:
+            if float(mod.get("angle_end_deg", 0)) >= 200:
+                return mods
+    mods.append(
+        {
+            "kind": "relief",
+            "z_min_mm": round(top * 0.28, 3),
+            "z_max_mm": round(top * 0.88, 3),
+            "angle_start_deg": 150.0,
+            "angle_end_deg": 210.0,
+            "depth_mm": 0.9,
+            "clinical_reason": "alivio posterior para flexión de rodilla (transtibial)",
+        }
+    )
+    return mods
 
 
 def _ensure_offset_samples(
@@ -28,6 +98,7 @@ def apply_clinical_preferences_to_agent(
     agent_payload: dict[str, Any],
     clinical_report: dict[str, Any],
     height_mm: float,
+    geometry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Post-proceso fiable: socket_preferences del JSON clínico override al LLM/reglas.
@@ -60,18 +131,43 @@ def apply_clinical_preferences_to_agent(
         overrides["extra_holgura_mm"] = extra_holgura
 
     structure = socket.setdefault("structure", {})
+    geo = geometry or {}
 
-    if "socket_length_fraction" in prefs:
-        frac = float(prefs["socket_length_fraction"])
-        structure["socket_length_fraction"] = frac
-        structure["trim_height_mm"] = round(height_mm * frac, 3)
-        overrides["socket_length_fraction"] = frac
-    elif pref := prefs.get("socket_length_preference"):
-        frac = _LENGTH_PREF_MAP.get(str(pref).lower(), 0.85)
-        structure["socket_length_fraction"] = frac
-        structure["trim_height_mm"] = round(height_mm * frac, 3)
+    explicit_frac = float(prefs["socket_length_fraction"]) if "socket_length_fraction" in prefs else None
+    explicit_trim = float(prefs["trim_height_mm"]) if prefs.get("trim_height_mm") else None
+    if pref := prefs.get("socket_length_preference"):
+        if explicit_frac is None:
+            explicit_frac = _LENGTH_PREF_MAP.get(str(pref).lower(), TRANSTIBIAL_DEFAULT_LENGTH_FRACTION)
         overrides["socket_length_preference"] = pref
-        overrides["socket_length_fraction"] = frac
+
+    default_frac = (
+        TRANSTIBIAL_DEFAULT_LENGTH_FRACTION
+        if is_transtibial_report(clinical_report)
+        else 0.85
+    )
+    use_knee = is_transtibial_report(clinical_report) and explicit_frac is None and explicit_trim is None
+    trim_mm, frac, trim_source = resolve_socket_trim_from_geometry(
+        geo,
+        height_mm,
+        default_fraction=default_frac,
+        explicit_fraction=explicit_frac,
+        explicit_trim_mm=explicit_trim,
+        use_knee_detection=use_knee,
+    )
+    frac = cap_transtibial_length_fraction(frac, clinical_report)
+    if frac != trim_mm / max(height_mm, 1.0):
+        trim_mm = round(height_mm * frac, 3)
+        trim_source = f"{trim_source}+transtibial_cap"
+
+    structure["trim_height_mm"] = round(trim_mm, 3)
+    structure["socket_length_fraction"] = round(frac, 4)
+    overrides["socket_length_fraction"] = structure["socket_length_fraction"]
+    overrides["trim_height_mm"] = structure["trim_height_mm"]
+    overrides["trim_source"] = trim_source
+    if knee := geo.get("knee_landmark"):
+        overrides["knee_landmark"] = knee
+
+    socket_top_z = float(structure["trim_height_mm"])
 
     if wall := prefs.get("wall_thickness_mm"):
         structure["wall_thickness_mm"] = wall
@@ -95,7 +191,7 @@ def apply_clinical_preferences_to_agent(
                 {
                     "kind": "relief",
                     "z_min_mm": 0.0,
-                    "z_max_mm": round(height_mm * 0.3, 3),
+                    "z_max_mm": round(socket_top_z * 0.3, 3),
                     "angle_start_deg": 0.0,
                     "angle_end_deg": 360.0,
                     "depth_mm": round(max(1.0, clearance * 0.5), 2),
@@ -110,8 +206,8 @@ def apply_clinical_preferences_to_agent(
             mods.append(
                 {
                     "kind": "ventilation_channel",
-                    "z_min_mm": round(height_mm * 0.2, 3),
-                    "z_max_mm": round(height_mm * 0.85, 3),
+                    "z_min_mm": round(socket_top_z * 0.2, 3),
+                    "z_max_mm": round(socket_top_z * 0.82, 3),
                     "angle_start_deg": 80.0,
                     "angle_end_deg": 100.0,
                     "depth_mm": 2.0,
@@ -119,7 +215,10 @@ def apply_clinical_preferences_to_agent(
                 }
             )
 
-    socket["local_modifications"] = mods
+    if is_transtibial_report(clinical_report):
+        mods = _ensure_posterior_knee_relief(mods, socket_top_z)
+
+    socket["local_modifications"] = _clamp_modifications_to_socket_height(mods, socket_top_z)
 
     if overrides:
         design_params["clinical_overrides_applied"] = True

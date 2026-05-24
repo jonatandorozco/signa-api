@@ -1,11 +1,11 @@
-"""Orquestación: escaneo → analyze → agente → CadQuery."""
+"""Orquestación: escaneo → analyze → OpenAI → CadQuery."""
 
 from __future__ import annotations
 
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from app.core.mesh_errors import EmptyMeshError, MeshError, MeshFileNotFoundError, MeshReadError
 from app.core.paths import DATOS_REPORTE_PATH, SOCKET_OUTPUT_ROOT, TEMP_UPLOAD_DIR
@@ -13,27 +13,7 @@ from app.services.mesh_analyzer import analyze_mesh
 from app.services.mesh_cleaner import clean_mesh
 from app.services.openai_socket_agent import run_openai_socket_agent
 from app.services.socket_cad_service import generate_socket_from_agent
-from app.services.socket_design_agent import load_default_clinical_report, run_socket_design_agent
-
-AgentEngine = Literal["openai", "rules"]
-
-
-def _run_agent(
-    geometry: dict[str, Any],
-    clinical_report: dict[str, Any],
-    *,
-    engine: AgentEngine,
-    openai_model: str | None,
-    fallback_to_rules: bool,
-) -> dict[str, Any]:
-    if engine == "openai":
-        return run_openai_socket_agent(
-            geometry,
-            clinical_report,
-            model=openai_model,
-            fallback_to_rules=fallback_to_rules,
-        )
-    return run_socket_design_agent(geometry, clinical_report)
+from app.services.socket_design_agent import load_default_clinical_report
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -45,16 +25,12 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def run_socket_pipeline(
     scan_path: Path,
     *,
-    engine: AgentEngine = "rules",
-    openai_model: str | None = None,
-    fallback_to_rules: bool = True,
-    generate_stl: bool = True,
     output_root: Path | None = None,
 ) -> dict[str, Any]:
     """
     Ejecuta el flujo completo sobre un escaneo ya guardado en disco.
 
-    Usa app/data/datos_reporte.json para datos clínicos.
+    Siempre usa OpenAI y genera socket.stl cuando hay socket_design.
     """
     if not scan_path.is_file():
         raise FileNotFoundError(f"Escaneo no encontrado: {scan_path}")
@@ -69,13 +45,7 @@ def run_socket_pipeline(
     geometry = analyze_mesh(str(scan_path))
     clinical = load_default_clinical_report()
 
-    agent_payload = _run_agent(
-        geometry,
-        clinical,
-        engine=engine,
-        openai_model=openai_model,
-        fallback_to_rules=fallback_to_rules,
-    )
+    agent_payload = run_openai_socket_agent(geometry, clinical)
 
     _write_json(job_dir / "geometry_analysis.json", geometry)
     _write_json(job_dir / "agent_response.json", agent_payload)
@@ -88,9 +58,10 @@ def run_socket_pipeline(
 
     cad_report: dict[str, Any] | None = None
     socket_stl: str | None = None
+    socket_ply: str | None = None
     socket_step: str | None = None
 
-    if generate_stl and socket_design is not None:
+    if socket_design is not None:
         try:
             cad_report = generate_socket_from_agent(geometry, agent_payload, job_dir)
         except ImportError as exc:
@@ -99,12 +70,15 @@ def run_socket_pipeline(
         exports = cad_report.get("exports") or {}
         if exports.get("stl"):
             socket_stl = str(job_dir / exports["stl"])
+        if exports.get("ply"):
+            socket_ply = str(job_dir / exports["ply"])
         if exports.get("step"):
             socket_step = str(job_dir / exports["step"])
 
     base = f"/socket/{job_id}"
     download_urls = {
         "stl": f"{base}/stl" if socket_stl else None,
+        "ply": f"{base}/ply" if socket_ply else None,
         "step": f"{base}/step" if socket_step else None,
         "report": f"{base}/report" if cad_report else None,
         "geometry": f"{base}/geometry",

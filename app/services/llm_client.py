@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Literal
 
+import app.core.env  # noqa: F401 — asegura .env si se importa sin main
 from openai import AzureOpenAI, OpenAI
 
 Provider = Literal["azure", "openai"]
@@ -46,13 +47,16 @@ def get_llm_client() -> OpenAI | AzureOpenAI:
 
     api_key = _strip_or_none(os.getenv("OPENAI_API_KEY"))
     if not api_key:
-        raise ValueError("OPENAI_API_KEY no configurada en .env")
+        raise ValueError(
+            "Configura AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY "
+            "o OPENAI_API_KEY en .env"
+        )
     return OpenAI(api_key=api_key)
 
 
-def get_deployment_name(override: str | None = None) -> str:
-    if override:
-        return override.strip()
+def get_deployment_name(model: str | None = None) -> str:
+    if model:
+        return model.strip()
     azure_dep = _strip_or_none(os.getenv("AZURE_OPENAI_DEPLOYMENT"))
     if azure_dep:
         return azure_dep

@@ -16,7 +16,6 @@ from app.services.socket_design_agent import (
     _build_local_modifications,
     _derive_clearance_mm,
     load_default_clinical_report,
-    run_socket_design_agent,
 )
 from app.services.socket_design_merge import finalize_agent_payload
 
@@ -289,12 +288,21 @@ def _sync_geometry_reference(payload: dict[str, Any], geometry: dict[str, Any]) 
     return payload
 
 
+def _format_llm_api_error(deployment: str, exc: Exception) -> ValueError:
+    message = str(exc)
+    if "DeploymentNotFound" in message:
+        return ValueError(
+            f"El deployment Azure '{deployment}' no existe en tu recurso. "
+            "Revisa AZURE_OPENAI_DEPLOYMENT en .env."
+        )
+    return ValueError(f"Error al llamar al LLM (deployment={deployment}): {exc}")
+
+
 def run_openai_socket_agent(
     geometry: GeometryResponse | dict[str, Any],
     clinical_report: dict[str, Any] | None = None,
     *,
     model: str | None = None,
-    fallback_to_rules: bool = True,
 ) -> dict[str, Any]:
     geo = _geometry_dict(geometry)
     report = clinical_report if clinical_report is not None else load_default_clinical_report()
@@ -309,12 +317,16 @@ def run_openai_socket_agent(
 
     client = get_llm_client()
     system_prompt = load_system_prompt()
-    raw = chat_json_completion(
-        client,
-        deployment=deployment,
-        system_prompt=system_prompt,
-        user_content=f"Genera el JSON de diseño de socket para estos datos:\n\n{user_message}",
-    )
+    try:
+        raw = chat_json_completion(
+            client,
+            deployment=deployment,
+            system_prompt=system_prompt,
+            user_content=f"Genera el JSON de diseño de socket para estos datos:\n\n{user_message}",
+        )
+    except Exception as exc:
+        raise _format_llm_api_error(deployment, exc) from exc
+
     try:
         parsed = _extract_json_object(raw)
         parsed = _sync_quality_gate_from_geometry(parsed, geo)
@@ -326,15 +338,4 @@ def run_openai_socket_agent(
         parsed["design_parameters"]["llm_provider"] = provider
         return finalize_agent_payload(parsed, geo, report)
     except Exception as exc:
-        if not fallback_to_rules:
-            raise ValueError(f"OpenAI devolvió JSON inválido: {exc}") from exc
-        rules = run_socket_design_agent(geo, report)
-        rules.setdefault("design_parameters", {})
-        rules["design_parameters"]["agent_engine"] = "rules_fallback"
-        rules["design_parameters"]["openai_error"] = str(exc)
-        rules["design_parameters"]["llm_deployment"] = deployment
-        rules["design_parameters"]["llm_provider"] = provider
-        msgs = list(rules.get("quality_gate", {}).get("messages", []))
-        msgs.append(f"Fallback a reglas: error OpenAI ({exc})")
-        rules["quality_gate"]["messages"] = msgs
-        return rules
+        raise ValueError(f"OpenAI devolvió JSON inválido: {exc}") from exc

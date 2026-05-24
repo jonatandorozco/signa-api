@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import open3d as o3d
 
 from app.core.mesh_errors import EmptyMeshError, MeshFileNotFoundError, MeshReadError
@@ -27,32 +28,63 @@ def load_mesh(path: str) -> o3d.geometry.TriangleMesh:
     return mesh
 
 
-def remove_duplicated_vertices(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-    mesh.remove_duplicated_vertices()
-    return mesh
+def _o3d_to_trimesh(mesh: o3d.geometry.TriangleMesh):
+    import trimesh
+
+    return trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices, dtype=np.float64),
+        faces=np.asarray(mesh.triangles, dtype=np.int64),
+        process=False,
+    )
 
 
-def remove_duplicated_triangles(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-    mesh.remove_duplicated_triangles()
-    return mesh
+def _trimesh_to_o3d(mesh) -> o3d.geometry.TriangleMesh:
+    o3d_mesh = o3d.geometry.TriangleMesh()
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces))
+    o3d_mesh.compute_vertex_normals()
+    return o3d_mesh
 
 
-def remove_degenerate_triangles(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-    mesh.remove_degenerate_triangles()
-    return mesh
+def repair_mesh_basic(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    """Limpieza previa al análisis: deduplicación, huecos pequeños y suavizado ligero."""
+    repaired = o3d.geometry.TriangleMesh(mesh)
+    repaired.remove_duplicated_vertices()
+    repaired.remove_duplicated_triangles()
+    repaired.remove_degenerate_triangles()
+    repaired.remove_non_manifold_edges()
+    repaired.remove_unreferenced_vertices()
+    try:
+        repaired.orient_triangles()
+    except (AttributeError, RuntimeError):
+        pass
 
+    try:
+        import trimesh
+        from trimesh import repair as trimesh_repair
 
-def compute_vertex_normals(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-    mesh.compute_vertex_normals()
-    return mesh
+        tm = _o3d_to_trimesh(repaired)
+        trimesh_repair.fill_holes(tm)
+        trimesh_repair.fix_normals(tm)
+        tm.merge_vertices(merge_tex=True, merge_norm=True)
+        repaired = _trimesh_to_o3d(tm)
+    except Exception:
+        pass
+
+    try:
+        repaired = repaired.filter_smooth_laplacian(number_of_iterations=3)
+    except Exception:
+        pass
+
+    repaired.remove_degenerate_triangles()
+    repaired.remove_unreferenced_vertices()
+    repaired.compute_vertex_normals()
+    return repaired
 
 
 def clean_mesh(path: str) -> o3d.geometry.TriangleMesh:
     mesh = load_mesh(path)
-    mesh = remove_duplicated_vertices(mesh)
-    mesh = remove_duplicated_triangles(mesh)
-    mesh = remove_degenerate_triangles(mesh)
-    mesh = compute_vertex_normals(mesh)
+    mesh = repair_mesh_basic(mesh)
 
     if mesh.is_empty() or len(mesh.vertices) == 0:
         raise EmptyMeshError("La malla quedó vacía después de la limpieza")

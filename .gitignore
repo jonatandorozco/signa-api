@@ -12,3 +12,4 @@ env/
 .pytest_cache/
 app/temp_upload/*
 !app/temp_upload/.gitkeep
+output/

@@ -66,13 +66,12 @@
   },
   "socket_preferences": {
     "radial_clearance_mm": 3.0,
-    "socket_length_fraction": 0.92,
-    "socket_length_preference": "longer",
+    "socket_length_preference": "standard",
     "distal_relief": true,
     "ventilation": true,
-    "wall_thickness_mm": { "proximal": 4.5, "distal": 6.0 },
+    "wall_thickness_mm": { "proximal": 3.5, "distal": 4.0 },
     "extra_holgura_mm": 0.5,
-    "notes": "demo: holgura generosa y socket más alto"
+    "notes": "transtibial: recorte automático por salto de área (rodilla) −10% hacia distal; override con trim_height_mm si hace falta"
   },
   "modelo miembro": "https://storage.signa.app/models/miembro-izquierdo-transtibial.stl",
   "modelo protesis": "https://storage.signa.app/models/protesis-izquierda-transtibial.stl"

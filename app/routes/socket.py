@@ -1,10 +1,10 @@
-"""Un solo endpoint: sube PLY/STL/OBJ → socket 3D."""
+"""Un solo endpoint: sube PLY/STL/OBJ → socket 3D (OpenAI + CadQuery)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from app.core.paths import SOCKET_OUTPUT_ROOT
@@ -21,35 +21,22 @@ router = APIRouter(tags=["socket"])
 @router.post("/socket", response_model=SocketRunResponse)
 async def create_socket_from_scan(
     file: UploadFile = File(..., description="Escaneo del muñón (.ply, .stl, .obj)"),
-    engine: str = Form("rules", description="rules | openai"),
-    generate_stl: bool = Form(True),
-    openai_model: str | None = Form(None),
-    fallback_to_rules: bool = Form(True),
 ) -> SocketRunResponse:
     """
-    Pipeline automático:
+    Pipeline automático (siempre OpenAI + STL):
 
     1. Guarda el escaneo
     2. Analyze (contornos + quality gate)
-    3. Socket-design (reglas o OpenAI + datos_reporte.json)
-    4. CadQuery → socket.stl en output/socket_generate/{job_id}/
+    3. OpenAI + datos_reporte.json
+    4. CadQuery → socket.stl + socket.ply en output/socket_generate/{job_id}/
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="El archivo debe tener nombre")
 
-    if engine not in ("rules", "openai"):
-        raise HTTPException(status_code=400, detail="engine debe ser 'rules' o 'openai'")
-
     try:
         content = await file.read()
         scan_path = save_uploaded_scan(content, file.filename)
-        result = run_socket_pipeline(
-            scan_path,
-            engine=engine,  # type: ignore[arg-type]
-            openai_model=openai_model,
-            fallback_to_rules=fallback_to_rules,
-            generate_stl=generate_stl,
-        )
+        result = run_socket_pipeline(scan_path)
     except Exception as exc:
         status, detail = mesh_error_to_http_detail(exc)
         raise HTTPException(status_code=status, detail=detail) from exc
@@ -79,6 +66,14 @@ def download_stl(job_id: str):
     if not path.is_file():
         raise HTTPException(status_code=404, detail="STL no generado (status blocked?)")
     return FileResponse(path, media_type="model/stl", filename="socket.stl")
+
+
+@router.get("/socket/{job_id}/ply")
+def download_ply(job_id: str):
+    path = _job_dir(job_id) / "socket.ply"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="PLY no generado (status blocked?)")
+    return FileResponse(path, media_type="application/octet-stream", filename="socket.ply")
 
 
 @router.get("/socket/{job_id}/step")

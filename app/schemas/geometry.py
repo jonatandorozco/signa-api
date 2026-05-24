@@ -25,6 +25,7 @@ class QualityGate(BaseModel):
     demo_eligible: bool
     mean_error_mm: float = Field(..., ge=0)
     max_error_mm: float = Field(..., ge=0)
+    p95_error_mm: float = Field(default=0.0, ge=0)
     section_similarity: float = Field(..., ge=0, le=1.0)
     volume_cm3: float | None = None
     volume_estimated: bool = False

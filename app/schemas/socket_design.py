@@ -43,11 +43,46 @@ class Ventilation(BaseModel):
     count: int
 
 
+class ProximalAdapter(BaseModel):
+    flare_mm: float = 3.0
+    flare_height_fraction: float = 0.12
+    collar_height_mm: float = 18.0
+    collar_extra_wall_mm: float = 1.5
+
+
+class TranstibialProfile(BaseModel):
+    enabled: bool = True
+    patellar_bar_depth_mm: float = 2.0
+    posterior_relief_mm: float = 0.8
+    lateral_flare_mm: float = 2.5
+
+
+class DistalClosure(BaseModel):
+    enabled: bool = True
+    cap_thickness_mm: float = 2.5
+    solid_height_mm: float = 28.0
+    cap_ring_mm: float = 2.5
+    neck_transition_fraction: float = 0.14
+    neck_wall_mm: float = 2.5
+
+
+class ProsthesisAdapter(BaseModel):
+    enabled: bool = True
+    solid_height_mm: float = 28.0
+    cap_ring_mm: float = 2.5
+    neck_transition_fraction: float = 0.14
+    neck_wall_mm: float = 2.5
+
+
 class SocketStructure(BaseModel):
     wall_thickness_mm: WallThickness
     trim_height_mm: float
     socket_length_fraction: float
     ventilation: Ventilation
+    proximal_adapter: ProximalAdapter = Field(default_factory=ProximalAdapter)
+    transtibial_profile: TranstibialProfile = Field(default_factory=TranstibialProfile)
+    distal_closure: DistalClosure = Field(default_factory=DistalClosure)
+    prosthesis_adapter: ProsthesisAdapter = Field(default_factory=ProsthesisAdapter)
 
 
 class SocketDesignSpec(BaseModel):
@@ -71,6 +106,7 @@ class AgentQualityGate(BaseModel):
     demo_eligible: bool
     mean_error_mm: float
     max_error_mm: float
+    p95_error_mm: float = 0.0
     section_similarity: float
     volume_cm3: float | None = None
     volume_estimated: bool = False

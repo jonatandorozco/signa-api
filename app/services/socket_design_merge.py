@@ -21,8 +21,18 @@ def attach_cad_geometry(payload: dict[str, Any], geometry: dict[str, Any]) -> di
         "quality_gate": geometry.get("quality_gate"),
         "shape_profile": geometry.get("shape_profile"),
         "sections": geometry.get("sections"),
+        "analysis_summary": geometry.get("analysis_summary"),
+        "knee_landmark": geometry.get("knee_landmark"),
     }
     return merged
+
+
+def _resolve_design_mode(quality_gate: dict[str, Any]) -> str:
+    if quality_gate.get("passed"):
+        return "production"
+    if quality_gate.get("demo_eligible"):
+        return "demo"
+    return "blocked"
 
 
 def resolve_geometry_from_agent(
@@ -47,9 +57,11 @@ def finalize_agent_payload(
 ) -> dict[str, Any]:
     """Preferencias clínicas post-LLM + cad_geometry + validación Pydantic."""
     height_mm = float(geometry.get("height_mm", 0))
-    payload = apply_clinical_preferences_to_agent(payload, clinical_report, height_mm)
+    payload = apply_clinical_preferences_to_agent(
+        payload, clinical_report, height_mm, geometry=geometry
+    )
     payload = attach_cad_geometry(payload, geometry)
     qg = payload.get("quality_gate") or {}
     handoff = payload.setdefault("cadquery_handoff", {})
-    handoff["design_mode"] = "production" if qg.get("passed") else "demo"
+    handoff["design_mode"] = _resolve_design_mode(qg)
     return SocketDesignAgentResponse(**payload).model_dump()

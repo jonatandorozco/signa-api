@@ -16,7 +16,7 @@ import trimesh
 from trimesh import repair as trimesh_repair
 
 from app.core.mesh_errors import EmptyMeshError, MeshFileNotFoundError, MeshReadError
-from app.services.mesh_cleaner import SUPPORTED_EXTENSIONS, load_mesh
+from app.services.mesh_cleaner import SUPPORTED_EXTENSIONS, load_mesh, repair_mesh_basic
 
 # --- Parámetros ---
 _MIN_SECTIONS = 30
@@ -27,7 +27,7 @@ _OUTLIER_NB_NEIGHBORS = 24
 _OUTLIER_STD_RATIO = 2.0
 _END_BAND_FRACTION = 0.12
 _RDP_EPSILON_RATIO = 0.004  # ε relativo al perímetro del contorno
-_LAPLACIAN_ITERATIONS = 2
+_LAPLACIAN_ITERATIONS = 4
 _LONGITUDINAL_SMOOTH_WINDOW = 3
 _CONTOUR_RESAMPLE_POINTS = 128
 _RECON_VERTEX_SAMPLE = 25_000
@@ -36,9 +36,16 @@ _MAX_END_TRIM_FRACTION = 0.12
 _QUALITY_MEAN_MM_PRODUCTION = 2.0
 _QUALITY_MEAN_MM_DEMO = 3.0
 _QUALITY_MAX_MM_PRODUCTION = 12.0
-# Muñón en metros suele tener extent < 5; en mm suele ser 200–500+
-_MM_SCALE_THRESHOLD = 5.0
+# Muñón: m <5, cm 5–120, mm 120–800; >800 suele ser µm o mm×1000 (export CAD erróneo)
+_MM_SCALE_THRESHOLD_M = 5.0
+_MM_SCALE_THRESHOLD_CM = 120.0
+_MM_MAX_PLAUSIBLE_EXTENT_MM = 800.0
 _MM_PER_METER = 1000.0
+_MM_PER_CM = 10.0
+_MM_PER_MICRON = 0.001
+_ANALYSIS_TARGET_TRIANGLES = 80_000
+_RECON_END_BAND_FRACTION = 0.08
+_QUALITY_P95_MM_PRODUCTION = 5.0
 
 
 class SectionDict(TypedDict):
@@ -228,34 +235,108 @@ def _trimesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
 
 
 def repair_mesh_for_analysis(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-    """
-    Reparación previa al análisis: deduplicación, orientación, huecos pequeños,
-    suavizado Laplaciano ligero.
-    """
-    repaired = o3d.geometry.TriangleMesh(mesh)
-    repaired.remove_duplicated_vertices()
-    repaired.remove_duplicated_triangles()
-    repaired.remove_degenerate_triangles()
-    repaired.remove_non_manifold_edges()
-    try:
-        repaired.orient_triangles()
-    except (AttributeError, RuntimeError):
-        pass
+    """Reparación previa al análisis (delegada a mesh_cleaner + decimación opcional)."""
+    repaired = repair_mesh_basic(mesh)
+    return _decimate_for_analysis(repaired)
 
-    tm = _o3d_to_trimesh(repaired)
+
+def _decimate_for_analysis(
+    mesh: o3d.geometry.TriangleMesh,
+    target_triangles: int = _ANALYSIS_TARGET_TRIANGLES,
+) -> o3d.geometry.TriangleMesh:
+    """Reduce densidad en mallas muy pesadas sin perder la silueta."""
+    n_tris = len(mesh.triangles)
+    if n_tris <= target_triangles:
+        return mesh
     try:
-        trimesh_repair.fill_holes(tm)
-        trimesh_repair.fix_normals(tm)
+        simplified = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
+        simplified.remove_degenerate_triangles()
+        simplified.remove_unreferenced_vertices()
+        simplified.compute_vertex_normals()
+        if len(simplified.vertices) >= 100 and len(simplified.triangles) >= 50:
+            return simplified
     except Exception:
         pass
-    repaired = _trimesh_to_o3d(tm)
+    return mesh
 
-    try:
-        repaired = repaired.filter_smooth_laplacian(number_of_iterations=_LAPLACIAN_ITERATIONS)
-    except Exception:
-        pass
-    repaired.compute_vertex_normals()
-    return repaired
+
+def normalize_mesh_to_mm(mesh: o3d.geometry.TriangleMesh) -> tuple[o3d.geometry.TriangleMesh, float]:
+    """
+    Escala la malla a milímetros según heurística de extent (bbox máximo):
+    - < 5 → metros (×1000)
+    - 5–120 → centímetros (×10)
+    - 120–800 → ya en mm
+    - > 800 → probable µm o mm mal etiquetados (÷1000 repetido hasta extent plausible)
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if vertices.size == 0:
+        return mesh, 1.0
+    factor = 1.0
+    while True:
+        extent = float(np.max(vertices.max(axis=0) - vertices.min(axis=0)))
+        if extent > _MM_MAX_PLAUSIBLE_EXTENT_MM:
+            factor *= _MM_PER_MICRON
+            vertices = vertices * _MM_PER_MICRON
+            continue
+        if extent >= _MM_SCALE_THRESHOLD_CM:
+            break
+        if extent >= _MM_SCALE_THRESHOLD_M:
+            factor *= _MM_PER_CM
+            vertices = vertices * _MM_PER_CM
+            break
+        factor *= _MM_PER_METER
+        vertices = vertices * _MM_PER_METER
+        break
+    if abs(factor - 1.0) < 1e-12:
+        return mesh, 1.0
+    scaled = o3d.geometry.TriangleMesh(mesh)
+    scaled.vertices = o3d.utility.Vector3dVector(vertices)
+    scaled.compute_vertex_normals()
+    return scaled, factor
+
+
+def center_mesh_xy(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    """Centra la malla en XY (mantiene z distal en 0)."""
+    centered = o3d.geometry.TriangleMesh(mesh)
+    vertices = np.asarray(centered.vertices, dtype=np.float64).copy()
+    if vertices.size == 0:
+        return centered
+    cx = float(np.mean(vertices[:, 0]))
+    cy = float(np.mean(vertices[:, 1]))
+    vertices[:, 0] -= cx
+    vertices[:, 1] -= cy
+    centered.vertices = o3d.utility.Vector3dVector(vertices)
+    centered.compute_vertex_normals()
+    return centered
+
+
+def _center_sections_xy(sections: list[SectionDict]) -> list[SectionDict]:
+    """Centra contornos en XY para loft CAD consistente en origen."""
+    valid = [s for s in sections if s["contour_point_count"] >= 3]
+    if not valid:
+        return sections
+    all_pts = np.vstack([np.array(s["contour"], dtype=np.float64) for s in valid])
+    cx, cy = float(all_pts[:, 0].mean()), float(all_pts[:, 1].mean())
+    centered: list[SectionDict] = []
+    for sec in sections:
+        if sec["contour_point_count"] < 3:
+            centered.append(sec)
+            continue
+        pts = np.array(sec["contour"], dtype=np.float64)
+        pts[:, 0] -= cx
+        pts[:, 1] -= cy
+        area, perim = _polygon_area_perimeter(pts)
+        centered.append(
+            SectionDict(
+                z_mm=sec["z_mm"],
+                area_mm2=round(area, 3),
+                perimeter_mm=round(perim, 3),
+                curvature_score=round(_curvature_score(pts), 5),
+                contour_point_count=int(pts.shape[0]),
+                contour=[[round(float(x), 4), round(float(y), 4)] for x, y in pts],
+            )
+        )
+    return centered
 
 
 def remove_statistical_outlier(
@@ -313,23 +394,6 @@ def _principal_axis_pca(vertices: np.ndarray) -> np.ndarray:
     evals, evecs = np.linalg.eigh(cov)
     principal = evecs[:, int(np.argmax(evals))]
     return principal if principal[2] >= 0 else -principal
-
-
-def normalize_mesh_to_mm(mesh: o3d.geometry.TriangleMesh) -> tuple[o3d.geometry.TriangleMesh, float]:
-    """
-    Escala la malla a milímetros si las unidades parecen metros (extent máximo < 5).
-    Devuelve (malla, factor aplicado: 1.0 o 1000.0).
-    """
-    vertices = np.asarray(mesh.vertices)
-    if vertices.size == 0:
-        return mesh, 1.0
-    extent = float(np.max(vertices.max(axis=0) - vertices.min(axis=0)))
-    if extent >= _MM_SCALE_THRESHOLD:
-        return mesh, 1.0
-    scaled = o3d.geometry.TriangleMesh(mesh)
-    scaled.vertices = o3d.utility.Vector3dVector(vertices * _MM_PER_METER)
-    scaled.compute_vertex_normals()
-    return scaled, _MM_PER_METER
 
 
 def _contours_xy_from_path3d(path: trimesh.path.Path3D) -> list[np.ndarray]:
@@ -600,6 +664,149 @@ def _trim_irregular_end_sections(sections: list[SectionDict]) -> list[SectionDic
     return [dict(s) for s in sections[keep_from : keep_to + 1]]
 
 
+KNEE_MARGIN_BELOW_BREAK_FRACTION = 0.18
+KNEE_SEARCH_LOWER_Z_FRACTION = 0.32
+KNEE_STUMP_UPPER_FRACTION = 0.48
+MIN_RELATIVE_AREA_JUMP = 1.15
+KNEE_ONSET_AREA_RATIO = 1.18
+MIN_SOCKET_SPAN_FRACTION = 0.35
+
+
+def detect_knee_area_break(
+    sections: list[SectionDict],
+    *,
+    margin_below_break_fraction: float = KNEE_MARGIN_BELOW_BREAK_FRACTION,
+) -> dict[str, Any]:
+    """
+    Detecta salto brusco de área proximal (transición muñón → rodilla en el escaneo).
+
+    El tope sugerido del socket queda `margin_below_break_fraction` por debajo del salto,
+    medido desde z distal (hacia abajo = menos z).
+    """
+    valid = sorted(
+        [s for s in sections if int(s.get("contour_point_count", 0) or 0) >= 3 and s.get("area_mm2", 0) > 0],
+        key=lambda s: float(s["z_mm"]),
+    )
+    empty: dict[str, Any] = {
+        "detected": False,
+        "area_break_z_mm": None,
+        "suggested_trim_height_mm": None,
+        "margin_below_break_fraction": margin_below_break_fraction,
+        "relative_area_jump": None,
+    }
+    if len(valid) < 6:
+        return empty
+
+    z_vals = np.array([float(s["z_mm"]) for s in valid], dtype=np.float64)
+    areas = np.array([float(s["area_mm2"]) for s in valid], dtype=np.float64)
+    z_min = float(z_vals[0])
+    z_max = float(z_vals[-1])
+    span = z_max - z_min
+    if span < 50.0:
+        return empty
+
+    search_z_min = z_min + KNEE_SEARCH_LOWER_Z_FRACTION * span
+    stump_mask = z_vals <= z_min + KNEE_STUMP_UPPER_FRACTION * span
+    stump_ref = float(np.median(areas[stump_mask])) if np.any(stump_mask) else float(np.median(areas))
+
+    first_onset_z: float | None = None
+    for i in range(len(valid) - 1):
+        z_mid = 0.5 * (z_vals[i] + z_vals[i + 1])
+        if z_mid < search_z_min:
+            continue
+        if float(areas[i + 1]) >= stump_ref * KNEE_ONSET_AREA_RATIO and float(areas[i]) <= stump_ref * 1.08:
+            first_onset_z = float(z_vals[i])
+            break
+
+    best_score = 0.0
+    best_z_break: float | None = None
+    best_jump = 1.0
+    best_idx = -1
+
+    for i in range(len(valid) - 1):
+        z_mid = 0.5 * (z_vals[i] + z_vals[i + 1])
+        if z_mid < search_z_min:
+            continue
+        dz = float(z_vals[i + 1] - z_vals[i])
+        if dz < 1e-6:
+            continue
+        a0, a1 = float(areas[i]), float(areas[i + 1])
+        if a1 <= a0:
+            continue
+        rel_jump = a1 / max(a0, 1e-6)
+        if rel_jump < MIN_RELATIVE_AREA_JUMP:
+            continue
+        da_dz = (a1 - a0) / dz
+        score = (rel_jump - 1.0) * da_dz
+        if score > best_score:
+            best_score = score
+            best_z_break = float(z_vals[i + 1])
+            best_jump = rel_jump
+            best_idx = i + 1
+
+    if best_z_break is None and first_onset_z is None:
+        return empty
+
+    if first_onset_z is not None:
+        z_break = first_onset_z
+        idx = min(int(np.searchsorted(z_vals, first_onset_z, side="right")), len(areas) - 1)
+        prev_a = float(areas[idx - 1]) if idx > 0 else stump_ref
+        best_jump = float(areas[idx] / max(prev_a, 1e-6))
+    else:
+        z_break = float(best_z_break)
+
+    margin = margin_below_break_fraction * (z_break - z_min)
+    z_trim = z_break - margin
+    min_trim = z_min + max(MIN_SOCKET_SPAN_FRACTION * span, 60.0)
+    z_trim = float(np.clip(z_trim, min_trim, z_max - 1.0))
+
+    return {
+        "detected": True,
+        "area_break_z_mm": round(z_break, 3),
+        "suggested_trim_height_mm": round(z_trim, 3),
+        "margin_below_break_fraction": margin_below_break_fraction,
+        "relative_area_jump": round(best_jump, 4) if best_jump else None,
+        "first_onset_z_mm": round(first_onset_z, 3) if first_onset_z is not None else None,
+        "peak_jump_z_mm": round(float(best_z_break), 3) if best_z_break is not None else None,
+        "detection_score": round(best_score, 4),
+        "stump_reference_area_mm2": round(stump_ref, 3),
+        "z_min_mm": round(z_min, 3),
+        "z_max_mm": round(z_max, 3),
+    }
+
+
+def resolve_socket_trim_from_geometry(
+    geometry: dict[str, Any],
+    height_mm: float,
+    *,
+    default_fraction: float,
+    explicit_fraction: float | None = None,
+    explicit_trim_mm: float | None = None,
+    use_knee_detection: bool = True,
+) -> tuple[float, float, str]:
+    """
+    Devuelve (trim_height_mm, socket_length_fraction, source).
+    Prioridad: trim explícito > fracción explícita > rodilla detectada > default.
+    """
+    height_mm = max(float(height_mm), 1.0)
+    if explicit_trim_mm is not None and explicit_trim_mm > 0:
+        trim = min(float(explicit_trim_mm), height_mm)
+        return trim, trim / height_mm, "explicit_trim_height_mm"
+
+    if explicit_fraction is not None:
+        frac = float(explicit_fraction)
+        return round(height_mm * frac, 3), frac, "explicit_socket_length_fraction"
+
+    landmark = geometry.get("knee_landmark") or {}
+    if use_knee_detection and landmark.get("detected") and landmark.get("suggested_trim_height_mm"):
+        trim = float(landmark["suggested_trim_height_mm"])
+        trim = min(max(trim, 1.0), height_mm)
+        return trim, trim / height_mm, "knee_area_break"
+
+    frac = float(default_fraction)
+    return round(height_mm * frac, 3), frac, "default_fraction"
+
+
 def build_shape_profile(sections: list[SectionDict]) -> dict[str, list[float]]:
     """Mapa longitudinal de crecimiento e irregularidad."""
     valid = [s for s in sections if s["contour_point_count"] >= 3]
@@ -656,9 +863,10 @@ def reconstruction_error(
     mesh: o3d.geometry.TriangleMesh, sections: list[SectionDict]
 ) -> dict[str, float]:
     """
-    Distancia en el plano XY de cada vértice al contorno del corte más cercano en Z.
+    Distancia en XY de vértices al contorno del corte más cercano en Z.
 
-    Objetivo de diseño: mean_error_mm < 1 mm con contornos densos y 30–60 cortes.
+    Excluye bandas distal/proximal (apertura del muñón y artefactos de borde).
+    El quality gate usa p95; max_error se conserva solo como diagnóstico.
     """
     valid_sections = [
         (sec["z_mm"], np.array(sec["contour"], dtype=np.float64))
@@ -670,8 +878,15 @@ def reconstruction_error(
 
     z_levels = np.array([z for z, _ in valid_sections], dtype=np.float64)
     contours = [c for _, c in valid_sections]
+    z_min, z_max = float(z_levels.min()), float(z_levels.max())
+    band = max((z_max - z_min) * _RECON_END_BAND_FRACTION, 1.0)
 
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    in_band = (vertices[:, 2] >= z_min + band) & (vertices[:, 2] <= z_max - band)
+    vertices = vertices[in_band]
+    if vertices.shape[0] == 0:
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+
     if vertices.shape[0] > _RECON_VERTEX_SAMPLE:
         rng = np.random.default_rng(42)
         vertices = vertices[rng.choice(vertices.shape[0], _RECON_VERTEX_SAMPLE, replace=False)]
@@ -739,27 +954,32 @@ def build_quality_gate(
 ) -> dict[str, Any]:
     mean_err = reconstruction["mean_error_mm"]
     max_err = reconstruction["max_error_mm"]
+    p95_err = reconstruction["p95_error_mm"]
     messages: list[str] = []
 
     if mean_err > _QUALITY_MEAN_MM_PRODUCTION:
         messages.append(
             f"mean_error_mm {mean_err} > {_QUALITY_MEAN_MM_PRODUCTION} (umbral socket clínico)"
         )
+    if p95_err > _QUALITY_P95_MM_PRODUCTION:
+        messages.append(
+            f"p95_error_mm {p95_err} > {_QUALITY_P95_MM_PRODUCTION} (revisar ruido o secciones)"
+        )
     if max_err > _QUALITY_MAX_MM_PRODUCTION:
         messages.append(
-            f"max_error_mm {max_err} > {_QUALITY_MAX_MM_PRODUCTION} (revisar extremos o geometría extra)"
+            f"max_error_mm {max_err} > {_QUALITY_MAX_MM_PRODUCTION} (outliers en extremos; informativo)"
         )
     if volume_cm3 is None:
         messages.append("volume_cm3 no disponible")
     elif volume_estimated:
-        messages.append("volume_cm3 estimado por integración de secciones (malla no cerrada)")
+        messages.append("volume_cm3 estimado por integración de secciones (muñón abierto en proximal)")
 
     if section_similarity < 0.85:
         messages.append(f"section_similarity {section_similarity} < 0.85")
 
     production_ok = (
         mean_err <= _QUALITY_MEAN_MM_PRODUCTION
-        and max_err <= _QUALITY_MAX_MM_PRODUCTION
+        and p95_err <= _QUALITY_P95_MM_PRODUCTION
         and volume_cm3 is not None
         and section_similarity >= 0.85
     )
@@ -775,6 +995,7 @@ def build_quality_gate(
         "demo_eligible": demo_ok,
         "mean_error_mm": mean_err,
         "max_error_mm": max_err,
+        "p95_error_mm": p95_err,
         "section_similarity": section_similarity,
         "volume_cm3": volume_cm3,
         "volume_estimated": volume_estimated,
@@ -819,15 +1040,17 @@ def analyze_mesh(path: str) -> AnalysisResult:
     if not mesh.has_triangles() or len(mesh.triangles) == 0:
         raise EmptyMeshError("La malla no contiene triángulos")
 
-    mesh, _scale_to_mm = normalize_mesh_to_mm(mesh)
+    mesh, scale_to_mm = normalize_mesh_to_mm(mesh)
 
     try:
         repaired = repair_mesh_for_analysis(mesh)
         aligned, _ = align_mesh_pca(repaired)
         oriented = orient_mesh_anatomical(aligned)
+        oriented = center_mesh_xy(oriented)
         raw_sections = extract_real_contours(oriented)
         sections = smooth_contours_longitudinally(raw_sections)
         sections = _trim_irregular_end_sections(sections)
+        sections = _center_sections_xy(sections)
         shape_profile = build_shape_profile(sections)
         surface_metrics = compute_surface_metrics(sections)
         section_sim = compute_section_similarity(sections)
@@ -836,6 +1059,7 @@ def analyze_mesh(path: str) -> AnalysisResult:
         height_mm = float(max(valid_z)) if valid_z else float(np.asarray(oriented.vertices)[:, 2].max())
         volume_cm3, volume_estimated = _compute_volume_cm3(oriented, sections)
         quality_gate = build_quality_gate(recon_err, volume_cm3, volume_estimated, section_sim)
+        knee_landmark = detect_knee_area_break(sections)
     except EmptyMeshError:
         raise
     except Exception as exc:
@@ -843,11 +1067,53 @@ def analyze_mesh(path: str) -> AnalysisResult:
 
     return {
         "height_mm": round(height_mm, 3),
+        "mesh_scale_to_mm_factor": round(scale_to_mm, 6),
         "volume_cm3": volume_cm3,
         "sections": sections,
         "shape_profile": shape_profile,
+        "knee_landmark": knee_landmark,
         "section_similarity": section_sim,
         "reconstruction_error": recon_err,
         "quality_gate": quality_gate,
+        "analysis_summary": _build_analysis_summary(
+            height_mm,
+            volume_cm3,
+            volume_estimated,
+            recon_err,
+            quality_gate,
+            section_sim,
+            knee_landmark,
+        ),
         **surface_metrics,
     }
+
+
+def _build_analysis_summary(
+    height_mm: float,
+    volume_cm3: float | None,
+    volume_estimated: bool,
+    recon: dict[str, float],
+    quality_gate: dict[str, Any],
+    section_similarity: float,
+    knee_landmark: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resumen compacto para agente/LLM (sin contornos)."""
+    summary: dict[str, Any] = {
+        "height_mm": round(height_mm, 3),
+        "volume_cm3": volume_cm3,
+        "volume_estimated": volume_estimated,
+        "section_similarity": section_similarity,
+        "mean_error_mm": recon.get("mean_error_mm"),
+        "p95_error_mm": recon.get("p95_error_mm"),
+        "max_error_mm": recon.get("max_error_mm"),
+        "quality_passed": quality_gate.get("passed"),
+        "demo_eligible": quality_gate.get("demo_eligible"),
+        "messages": quality_gate.get("messages", []),
+    }
+    if knee_landmark and knee_landmark.get("detected"):
+        summary["knee_landmark"] = {
+            "area_break_z_mm": knee_landmark.get("area_break_z_mm"),
+            "suggested_trim_height_mm": knee_landmark.get("suggested_trim_height_mm"),
+            "relative_area_jump": knee_landmark.get("relative_area_jump"),
+        }
+    return summary
