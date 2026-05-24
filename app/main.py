@@ -4,7 +4,10 @@ from pathlib import Path
 
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import get_cors_origins
+from app.routers import livekit
 from app.services.s3 import (
     apply_presigned_model_urls,
     upload_fileobj_to_r2,
@@ -12,6 +15,16 @@ from app.services.s3 import (
 )
 
 app = FastAPI(title="Signa API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(livekit.router)
 
 DATOS_REPORTE_PATH = Path(__file__).resolve().parent / "data" / "datos_reporte.json"
 ESCANEO_PREFIX = "escaneos"
