@@ -1,3 +1,4 @@
+import io
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -8,10 +9,11 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.config import get_settings
 
 MODEL_URL_FIELDS = ("modelo miembro", "modelo protesis")
-ALLOWED_SCAN_EXTENSIONS = {".stl", ".ply"}
+ALLOWED_SCAN_EXTENSIONS = {".stl", ".ply", ".obj"}
 CONTENT_TYPE_BY_EXTENSION = {
     ".stl": "model/stl",
     ".ply": "application/octet-stream",
+    ".obj": "model/obj",
 }
 
 
@@ -98,6 +100,15 @@ def upload_fileobj_to_r2(
         ExtraArgs={"ContentType": resolved_content_type},
     )
     return key
+
+
+def upload_bytes_to_r2(
+    content: bytes,
+    object_key: str,
+    *,
+    content_type: str | None = None,
+) -> str:
+    return upload_fileobj_to_r2(io.BytesIO(content), object_key, content_type=content_type)
 
 
 def apply_presigned_model_urls(data: dict) -> None:

@@ -1,4 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libxrender1 \
+    libxext6 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.5 /uv /uvx /bin/
 
@@ -14,6 +22,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-install-project
 
 COPY app/ ./app/
+COPY socket_design.cad.py ./
 
 ENV PATH="/app/.venv/bin:$PATH"
 

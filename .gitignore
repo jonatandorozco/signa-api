@@ -10,3 +10,5 @@ env/
 .vscode/
 *.egg-info/
 .pytest_cache/
+app/temp_upload/
+output/

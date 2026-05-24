@@ -1,20 +1,22 @@
 import json
-import uuid
 from pathlib import Path
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_cors_origins
-from app.routers import livekit
-from app.services.s3 import (
-    apply_presigned_model_urls,
-    upload_fileobj_to_r2,
-    validate_scan_extension,
-)
+from app.core.logging_config import configure_logging
+from app.routers import escaneo, livekit
+from app.services.s3 import apply_presigned_model_urls
 
-app = FastAPI(title="Signa API", version="1.0.0")
+configure_logging()
+
+app = FastAPI(
+    title="Signa API",
+    version="2.0.0",
+    description="Sube un escaneo (.ply/.stl/.obj) con POST /escaneo y obtén el socket 3D.",
+)
 
 cors_origins = get_cors_origins()
 app.add_middleware(
@@ -26,9 +28,9 @@ app.add_middleware(
 )
 
 app.include_router(livekit.router)
+app.include_router(escaneo.router)
 
 DATOS_REPORTE_PATH = Path(__file__).resolve().parent / "data" / "datos_reporte.json"
-ESCANEO_PREFIX = "escaneos"
 
 
 @app.get("/datos_reporte")
@@ -55,35 +57,3 @@ def get_datos_reporte():
         )
 
     return data
-
-
-@app.post("/escaneo")
-async def subir_escaneo(archivo: UploadFile = File(...)):
-    try:
-        extension = validate_scan_extension(archivo.filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    if not archivo.filename:
-        raise HTTPException(status_code=400, detail="El archivo debe tener nombre")
-
-    object_key = f"{ESCANEO_PREFIX}/{uuid.uuid4().hex}{extension}"
-
-    try:
-        upload_fileobj_to_r2(archivo.file, object_key)
-    except KeyError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Variable de entorno requerida no configurada: {exc.args[0]}",
-        )
-    except (ClientError, BotoCoreError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"No se pudo subir el escaneo a R2: {exc}",
-        )
-
-    return {
-        "object_key": object_key,
-        "filename": archivo.filename,
-        "format": extension.lstrip("."),
-    }
