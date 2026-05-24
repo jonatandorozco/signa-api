@@ -1,6 +1,8 @@
 {
   "patient_profile": {
     "full_name": "Carlos Mendoza López",
+    "email": "carlos.mendoza@example.com",
+    "password": "1234",
     "age": 34,
     "height_cm": 172,
     "weight_kg": 78,
