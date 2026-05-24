@@ -11,8 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_NO_DEV=1
 
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project
+RUN uv sync --locked --no-install-project
 
 COPY app/ ./app/
 
