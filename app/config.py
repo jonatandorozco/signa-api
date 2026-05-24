@@ -37,7 +37,9 @@ def get_livekit_config() -> dict | None:
 
 @lru_cache
 def get_cors_origins() -> list[str]:
-    raw = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+    raw = os.getenv("CORS_ORIGINS", "*").strip()
+    if raw == "*":
+        return ["*"]
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
