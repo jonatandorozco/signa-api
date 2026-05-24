@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_cors_origins
 from app.core.logging_config import configure_logging
-from app.routers import escaneo, livekit
+from app.routers import escaneo, livekit, models
 from app.services.s3 import apply_presigned_model_urls
 
 configure_logging()
@@ -29,6 +29,7 @@ app.add_middleware(
 
 app.include_router(livekit.router)
 app.include_router(escaneo.router)
+app.include_router(models.router)
 
 DATOS_REPORTE_PATH = Path(__file__).resolve().parent / "data" / "datos_reporte.json"
 
