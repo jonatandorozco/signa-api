@@ -1,0 +1,12 @@
+[project]
+name = "signa"
+version = "0.1.0"
+description = "Signa API — FastAPI service for report data and scan uploads"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.35.0",
+    "fastapi>=0.115.0",
+    "python-dotenv>=1.0.0",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.32.0",
+]
