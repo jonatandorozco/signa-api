@@ -1,0 +1,102 @@
+{
+  "generated_at": "2026-05-24T00:34:17.834876+00:00",
+  "status": "production",
+  "quality_gate_summary": {
+    "passed": true,
+    "demo_eligible": true,
+    "volume_estimated": false,
+    "messages": [
+      "Apto para socket con revisión clínica estándar"
+    ]
+  },
+  "parameters_used": {
+    "mode": "production",
+    "radial_clearance_mm": 2.0,
+    "wall_thickness_mm": 5.0,
+    "socket_length_fraction": 0.78,
+    "proximal_fillet_mm": 3.0,
+    "trim_bottom_fraction": 0.1,
+    "trim_top_fraction": 0.1,
+    "adjustments": [
+      "+0.5 mm holgura por: cambios de volumen, sensibilidad distal",
+      "+1 mm espesor por prioridad resistencia y actividad moderada+",
+      "Longitud reducida a 78% por dolor/sensibilidad distal",
+      "Filete proximal 3 mm por prioridad comodidad",
+      "Recorte inferior por irregularity_index elevado en extremo distal",
+      "Recorte superior por irregularity_index elevado en extremo proximal"
+    ]
+  },
+  "section_processing": {
+    "trim": {
+      "sections_before": 40,
+      "sections_after_trim": 32,
+      "trim_bottom_fraction": 0.1,
+      "trim_top_fraction": 0.1,
+      "z_range_mm": [
+        22.564,
+        197.436
+      ]
+    },
+    "length": {
+      "z_min": 22.564,
+      "z_max": 191.795,
+      "target_span_mm": 171.6,
+      "applied_fraction": 0.78,
+      "sections_used": 31
+    }
+  },
+  "geometry_checks": {
+    "height_mm_stump": 220.0,
+    "n_sections_input": 40,
+    "n_sections_loft": 31,
+    "volume_stump_cm3": 1850.0,
+    "volume_socket_cm3": 224.834,
+    "bbox_mm": {
+      "x_min": -54.695,
+      "x_max": 54.695,
+      "y_min": -47.207,
+      "y_max": 47.207,
+      "z_min": -0.0,
+      "z_max": 169.231,
+      "height_mm": 169.231
+    },
+    "height_coherence": {
+      "expected_height_mm": 171.6,
+      "x_min": -54.695,
+      "x_max": 54.695,
+      "y_min": -47.207,
+      "y_max": 47.207,
+      "z_min": -0.0,
+      "z_max": 169.231,
+      "height_mm": 169.231
+    },
+    "reconstruction_error": {
+      "mean_error_mm": 1.45,
+      "max_error_mm": 8.2,
+      "p95_error_mm": 3.1
+    },
+    "section_similarity": 0.91
+  },
+  "clinical_rationale": [
+    "Muñón transtibial probable (izquierdo): socket basado en contornos del analyze, sin copiar STL de referencia.",
+    "Uso previsto 8 h/día → holgura 2.0 mm y longitud 78%.",
+    "Prioridades del paciente (comodidad, resistencia, facilidad para poner y quitar) traducidas a espesor 5.0 mm y filete 3.0 mm.",
+    "Sudoración/irritación: holgura conservadora; ventilación distal recomendada en revisión clínica (no cerrar herméticamente).",
+    "Dolor reportado (4/10): longitud acortada para aliviar presión distal.",
+    "Datos faltantes (medidas clínicas exactas, escaneo del muñón, evaluación presencial): diseño preliminar, no apto sin evaluación presencial."
+  ],
+  "warnings": [
+    "Revisión dermatológica recomendada antes de fabricación."
+  ],
+  "recommended_clinical_review": [
+    "Evaluación presencial de interfaz muñón-socket y alineación.",
+    "Verificación de holgura radial con liner de prueba.",
+    "Mapa de presión distal y ajuste de longitud tras prueba de marcha.",
+    "Revisión de piel en zona distal y ventilación/perforaciones según sudoración."
+  ],
+  "exports": {
+    "stl": "socket.stl",
+    "step": "socket.step",
+    "script": "socket_design.cad.py"
+  }
+}
